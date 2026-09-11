@@ -35,7 +35,7 @@ DEBUG = env.bool("DJANGO_DEBUG", default=True)
 
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
-    default=["localhost", "127.0.0.1"],
+    default=["localhost", "127.0.0.1", "testserver"],
 )
 
 
@@ -54,7 +54,9 @@ INSTALLED_APPS = [
 
     # Third-party
     "rest_framework",
+    "projects",
     "corsheaders",
+    "rest_framework_simplejwt.token_blacklist",
     "accounts",
 ]
 
@@ -177,9 +179,21 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # =============================================================================
 
 REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+}
+
+from datetime import timedelta
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(days=6),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": False,
+    "UPDATE_LAST_LOGIN": True,
 }
 
 
@@ -208,3 +222,10 @@ CSRF_TRUSTED_ORIGINS = [
 # =============================================================================
 
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+
+#CROS 
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
