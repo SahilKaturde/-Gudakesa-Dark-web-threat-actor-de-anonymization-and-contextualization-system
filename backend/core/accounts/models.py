@@ -1,3 +1,5 @@
+import uuid
+
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.db import models
@@ -25,7 +27,6 @@ class UserManager(BaseUserManager):
             user.set_unusable_password()
 
         user.save(using=self._db)
-
         return user
 
     def create_superuser(self, username, email, password=None, **extra_fields):
@@ -44,13 +45,15 @@ class UserManager(BaseUserManager):
         user.is_active = True
 
         user.save(using=self._db)
-
         return user
 
 
 class User(AbstractBaseUser, PermissionsMixin):
-
-    id = models.BigAutoField(primary_key=True)
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
 
     username = models.CharField(
         max_length=150,
