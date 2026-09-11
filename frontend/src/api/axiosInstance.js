@@ -1,7 +1,13 @@
 import axios from "axios";
 
+const rawBaseURL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000/api";
+const normalizedBaseURL = rawBaseURL.replace(/\/+$/, "");
+const baseURL = normalizedBaseURL.endsWith("/api")
+    ? normalizedBaseURL
+    : `${normalizedBaseURL}/api`;
+
 const api = axios.create({
-    baseURL: `${import.meta.env.VITE_API_URL}/api`,
+    baseURL,
     headers: {
         "Content-Type": "application/json",
     },

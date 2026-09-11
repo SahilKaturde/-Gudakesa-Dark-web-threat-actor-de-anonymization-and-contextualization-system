@@ -1,11 +1,10 @@
 import React from "react";
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, Navigate } from "react-router-dom";
 
 import Home from "../pages/Home";
 import Project from "../pages/Project";
-import Login from "../pages/auth/Login";
-import Register from "../pages/auth/Register";
-import NotFound from "../pages/NotFound";
+import Login from "../pages/Login";
+import Register from "../pages/Register";
 
 import ProtectedRoute from "./ProtectedRoute";
 
@@ -43,10 +42,10 @@ const AppRoutes = () => {
                 }
             />
 
-            {/* 404 */}
+            {/* Fallback */}
             <Route
                 path="*"
-                element={<NotFound />}
+                element={<Navigate to="/" replace />}
             />
         </Routes>
     );

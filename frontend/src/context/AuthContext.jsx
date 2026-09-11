@@ -28,7 +28,7 @@ export const AuthProvider = ({ children }) => {
     // --------------------------------
     const fetchUserProfile = async () => {
         try {
-            const response = await api.get("/user/");
+            const response = await api.get("/auth/user/");
 
             setUser(response.data);
 
@@ -73,7 +73,7 @@ export const AuthProvider = ({ children }) => {
     // LOGIN
     // --------------------------------
     const login = async (username, password) => {
-        const response = await api.post("/login/", {
+        const response = await api.post("/auth/login/", {
             username,
             password,
         });
@@ -95,7 +95,7 @@ export const AuthProvider = ({ children }) => {
 
         // Get current user
         const userResponse =
-            await api.get("/user/");
+            await api.get("/auth/user/");
 
         setUser(userResponse.data);
 
@@ -113,7 +113,7 @@ export const AuthProvider = ({ children }) => {
     const register = async (userData) => {
         const response =
             await api.post(
-                "/register/",
+                "/auth/register/",
                 userData
             );
 
@@ -129,7 +129,7 @@ export const AuthProvider = ({ children }) => {
 
         if (refreshToken) {
             try {
-                await api.post("/logout/", {
+                await api.post("/auth/logout/", {
                     refresh: refreshToken,
                 });
             } catch (error) {

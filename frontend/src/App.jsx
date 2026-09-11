@@ -5,6 +5,7 @@ import ProtectedRoute from './routes/ProtectedRoute';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Home from './pages/Home';
+import Project from './pages/Project';
 
 const LogoutPage = () => {
   const { logout } = useAuth();
@@ -36,6 +37,14 @@ function App() {
             element={
               <ProtectedRoute>
                 <Home />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/project/:projectId"
+            element={
+              <ProtectedRoute>
+                <Project />
               </ProtectedRoute>
             }
           />
