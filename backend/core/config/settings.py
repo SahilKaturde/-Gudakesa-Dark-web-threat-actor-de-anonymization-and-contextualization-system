@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework_simplejwt.token_blacklist",
     "accounts",
+    "feature",
 ]
 
 
@@ -198,13 +199,11 @@ SIMPLE_JWT = {
 
 
 # =============================================================================
-# CORS - REACT FRONTEND
+# CORS - DEVELOPMENT (allow all origins for crawler + frontend)
 # =============================================================================
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_HEADERS = True
 
 
 # =============================================================================
@@ -214,6 +213,7 @@ CORS_ALLOWED_ORIGINS = [
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:8001",
 ]
 
 
@@ -222,10 +222,3 @@ CSRF_TRUSTED_ORIGINS = [
 # =============================================================================
 
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
-
-#CROS 
-
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]

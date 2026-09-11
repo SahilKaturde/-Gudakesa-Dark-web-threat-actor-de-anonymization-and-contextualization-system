@@ -6,6 +6,8 @@ import Project from "../pages/Project";
 import Login from "../pages/Login";
 import Register from "../pages/Register";
 
+import Playground from "../pages/Playground";
+
 import ProtectedRoute from "./ProtectedRoute";
 
 const AppRoutes = () => {
@@ -38,6 +40,16 @@ const AppRoutes = () => {
                 element={
                     <ProtectedRoute>
                         <Project />
+                    </ProtectedRoute>
+                }
+            />
+
+            {/* Playground */}
+            <Route
+                path="/playground/:domainId"
+                element={
+                    <ProtectedRoute>
+                        <Playground />
                     </ProtectedRoute>
                 }
             />

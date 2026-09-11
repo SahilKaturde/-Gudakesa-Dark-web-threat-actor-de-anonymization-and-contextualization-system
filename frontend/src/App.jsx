@@ -6,6 +6,7 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import Home from './pages/Home';
 import Project from './pages/Project';
+import Playground from './pages/Playground';
 
 const LogoutPage = () => {
   const { logout } = useAuth();
@@ -45,6 +46,14 @@ function App() {
             element={
               <ProtectedRoute>
                 <Project />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/playground/:domainId"
+            element={
+              <ProtectedRoute>
+                <Playground />
               </ProtectedRoute>
             }
           />
