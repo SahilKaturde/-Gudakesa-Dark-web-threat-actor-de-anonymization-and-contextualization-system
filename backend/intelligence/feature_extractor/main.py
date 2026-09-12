@@ -1,4 +1,11 @@
 import os
+
+# Prevent httpx proxy scheme error on Windows systems
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] = ""
+os.environ["ALL_PROXY"] = ""
+
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -14,28 +21,46 @@ from .database import get_db
 from .schemas import ExtractFeatureRequest, ExtractFeatureResponse
 from .graph import run_feature_extraction_pipeline
 from .models import ExtractedFeature, PageContent
+from .llm import DEFAULT_GEMINI_MODEL
+from .memory import init_memory_db, get_memory_stats
 
+
+# ─── Lifespan ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup + shutdown logic."""
+    # --- Startup ---
+    init_memory_db()
+    _log_startup_banner()
+    yield
+    # --- Shutdown ---
+    # Nothing to tear down; SQLite connections are per-call.
+
+
+def _log_startup_banner() -> None:
+    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+    key_status = f"SET ({key[:10]}...)" if key else "MISSING"
+    mem = get_memory_stats()
+
+    print("=" * 60)
+    print("  GUDAKESA Intelligence API v2.0.0")
+    print(f"  GOOGLE_API_KEY : {key_status}")
+    print(f"  GEMINI_MODEL   : {DEFAULT_GEMINI_MODEL}")
+    print(f"  MEMORY_DB      : {mem['size_mb']} MB / {mem['max_mb']} MB "
+          f"({mem['usage_pct']}%) · {mem['messages']} msgs · {mem['sessions']} sessions")
+    print(f"  EMBEDDINGS     : {'ON' if mem['embed_enabled'] else 'OFF'}")
+    print("=" * 60 + "\n")
+
+
+# ─── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="GUDAKESA Intelligence Feature Extractor API",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
-
-@app.on_event("startup")
-async def startup_log():
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.6-flash")
-    key_status = f"SET ({key[:12]}...)" if key and not key.startswith("your_") else "NOT SET / INVALID"
-    print(f"\n{'='*55}")
-    print(f"  GUDAKESA Intelligence API v2.0.0")
-    print(f"  OPENROUTER_API_KEY : {key_status}")
-    print(f"  OPENROUTER_MODEL   : {model}")
-    print(f"  OLLAMA_MODEL       : {os.getenv('OLLAMA_MODEL', 'qwen3:1.7b')}")
-    print(f"{'='*55}\n")
-
-
-# Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,13 +84,12 @@ def health():
 
 @app.get("/debug")
 def debug_config():
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    key_status = f"SET ({key[:12]}...)" if key and not key.startswith("your_") else "NOT SET or INVALID"
+    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+    key_status = f"SET ({key[:10]}...)" if key else "MISSING"
     return {
-        "openrouter_api_key_status": key_status,
-        "openrouter_model": os.getenv("OPENROUTER_MODEL", "google/gemini-3.6-flash (default)"),
-        "ollama_model": os.getenv("OLLAMA_MODEL", "qwen3:1.7b (default)"),
-        "ollama_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434 (default)"),
+        "google_api_key_status": key_status,
+        "gemini_model": DEFAULT_GEMINI_MODEL,
+        "memory": get_memory_stats(),
         "database_url_set": bool(os.getenv("DATABASE_URL")),
     }
 
@@ -76,11 +100,17 @@ def database_test(db: Session = Depends(get_db)):
     return {"database": "connected", "result": result.scalar()}
 
 
+@app.get("/api/v1/memory/status")
+def memory_status():
+    """Return persistent memory size, cap, and row counts."""
+    return get_memory_stats()
+
+
 # ─── Feature Extraction ────────────────────────────────────────────────────────
 
 @app.post("/api/v1/extract-features", response_model=ExtractFeatureResponse)
 def extract_features_endpoint(req: ExtractFeatureRequest, db: Session = Depends(get_db)):
-    """Triggers LangGraph feature extraction pipeline (OpenRouter → Ollama → Regex)."""
+    """Triggers LangGraph feature extraction pipeline (Gemini → Regex)."""
     page_text = req.page_text
 
     if not page_text:
@@ -88,7 +118,10 @@ def extract_features_endpoint(req: ExtractFeatureRequest, db: Session = Depends(
         if page_rec and page_rec.page_text:
             page_text = page_rec.page_text
         else:
-            raise HTTPException(status_code=400, detail="Page text not provided and not found in database.")
+            raise HTTPException(
+                status_code=400,
+                detail="Page text not provided and not found in database.",
+            )
 
     graph_res = run_feature_extraction_pipeline(
         domain_id=req.domain_id,
@@ -136,7 +169,9 @@ def get_features_endpoint(
             "context": r.context or "",
             "description": r.description or "",
             "confidence_score": r.confidence_score,
-            "extracted_timestamp": r.extracted_timestamp.isoformat() if r.extracted_timestamp else None,
+            "extracted_timestamp": (
+                r.extracted_timestamp.isoformat() if r.extracted_timestamp else None
+            ),
         }
         for r in records
     ]
@@ -151,34 +186,46 @@ class ChatRequest(BaseModel):
     history: Optional[List[dict]] = []
     page_id: Optional[str] = None
     domain_id: Optional[str] = None
+    session_id: Optional[str] = None   # enables persistent memory + cross-session recall
+
+
+class RecallItem(BaseModel):
+    session_id: str
+    score: float
 
 
 class ChatResponse(BaseModel):
     response: str
+    reasoning: Optional[str] = ""
     wants_graph: bool = False
     llm_used: str = "unknown"
     graph_base64: Optional[str] = None
     graph_type: Optional[str] = None
+    recalled: Optional[List[RecallItem]] = None
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest):
     """AI chat endpoint — analyzes page content and features, answers questions."""
-    from .chat import chat_with_ai, GRAPH_KEYWORDS
+    from .chat import chat_with_ai
     from .graphs import generate_feature_graph
+
+    # Default session_id from page_id so memory works even if client forgets
+    session_id = req.session_id or req.page_id
 
     result = chat_with_ai(
         message=req.message,
         page_text=req.page_text or "",
         features=req.features or [],
         history=req.history or [],
+        session_id=session_id,
     )
 
-    graph_b64 = None
-    graph_type_used = None
+    graph_b64 = result.get("graph_base64")
+    graph_type_used = "bar" if result.get("wants_graph") else None
 
-    # Auto-generate graph if user asked for one
-    if result.get("wants_graph") and req.features:
+    # Fallback to feature-based graph when the LLM didn't emit a tool call
+    if not graph_b64 and result.get("wants_graph") and req.features:
         msg_lower = req.message.lower()
         if "pie" in msg_lower:
             graph_type_used = "pie"
@@ -188,12 +235,23 @@ def chat_endpoint(req: ChatRequest):
             graph_type_used = "bar"
         graph_b64 = generate_feature_graph(req.features, graph_type_used)
 
+    recalled = result.get("recalled")
+    recalled_items = None
+    if recalled:
+        recalled_items = [
+            RecallItem(session_id=r["session_id"], score=float(r["score"]))
+            for r in recalled
+            if "session_id" in r and "score" in r
+        ]
+
     return ChatResponse(
         response=result["response"],
-        wants_graph=result.get("wants_graph", False),
+        reasoning=result.get("reasoning", ""),
+        wants_graph=bool(graph_b64 or result.get("wants_graph", False)),
         llm_used=result.get("llm_used", "unknown"),
         graph_base64=graph_b64,
         graph_type=graph_type_used,
+        recalled=recalled_items,
     )
 
 
@@ -242,18 +300,16 @@ class ReportRequest(BaseModel):
 
 @app.post("/api/v1/generate-report")
 def generate_report_endpoint(req: ReportRequest, db: Session = Depends(get_db)):
-    """Generate a structured CTI investigation report (OpenRouter → Ollama → fallback)."""
+    """Generate a structured CTI investigation report (Gemini → regex fallback)."""
     from .report import generate_investigation_report
 
     page_text = req.page_text or ""
 
-    # Load page text from DB if not provided
     if not page_text and req.page_id:
         page_rec = db.query(PageContent).filter(PageContent.page_id == req.page_id).first()
         if page_rec and page_rec.page_text:
             page_text = page_rec.page_text
 
-    # Load features from DB if not provided
     features = req.features or []
     if not features and req.page_id:
         db_features = db.query(ExtractedFeature).filter(
