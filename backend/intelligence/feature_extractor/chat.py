@@ -11,7 +11,9 @@ from .llm import (
     get_gemini_llm,
     strip_think,
     extract_reasoning,
+    content_to_text,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_MAX_OUTPUT_TOKENS,
 )
 from .graphs import (
     generate_custom_bar_chart,
@@ -28,11 +30,16 @@ from .memory import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MAX_TOKENS = 8192
-DOC_CHARS = 40000
-HISTORY_TURNS = 20
-HISTORY_CHARS = 4000
-RECALL_TOP_K = 4
+# Gemini 2.5 Flash accepts ~1M input tokens, so these limits were leaving
+# most of the model's context window unused — a big reason answers felt
+# shallow or "off" (the model just never saw enough of the document/history).
+# Roughly: 1 token ≈ 4 chars, so 120,000 chars ≈ 30k tokens for the document
+# alone, leaving plenty of headroom for history + recall + the system prompt.
+MAX_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS   # 32768 — was 8192, was truncating long analyses
+DOC_CHARS = 120000                       # was 40000
+HISTORY_TURNS = 40                       # was 20
+HISTORY_CHARS = 8000                     # was 4000, per-message cap
+RECALL_TOP_K = 6                         # was 4
 
 GRAPH_KEYWORDS = [
     "graph", "chart", "plot", "visualize", "visualisation",
@@ -228,12 +235,15 @@ def _run_chart_tools(response) -> Optional[str]:
 # Response finalizer
 # ---------------------------------------------------------------------------
 def _finalize(response, wants_graph: bool) -> Dict:
-    raw = getattr(response, "content", "") or ""
+    # response.content is NOT guaranteed to be a string — Gemini returns a
+    # list of parts whenever a tool call rides alongside text (which is
+    # exactly the wants_graph path). content_to_text() collapses it safely.
+    raw = content_to_text(getattr(response, "content", ""))
     reasoning = extract_reasoning(raw)
     answer = strip_think(raw)
 
     ak = getattr(response, "additional_kwargs", {}) or {}
-    side = ak.get("reasoning_content") or ak.get("reasoning") or ""
+    side = content_to_text(ak.get("reasoning_content") or ak.get("reasoning") or "")
     if side:
         reasoning = (reasoning + "\n" + side).strip()
 

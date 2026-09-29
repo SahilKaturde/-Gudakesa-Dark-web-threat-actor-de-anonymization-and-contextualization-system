@@ -12,6 +12,12 @@ class ExtractedFeature(models.Model):
         POST = "post", "Post"
         REVIEW = "review", "Review"
         PRODUCT = "product", "Product"
+        CRYPTO_WALLET = "crypto_wallet", "Crypto Wallet"
+        PGP_KEY = "pgp_key", "PGP Key"
+        ONION_URL = "onion_url", "Onion URL"
+        XMPP = "xmpp", "XMPP/Jabber"
+        PHONE = "phone", "Phone"
+        FINANCIAL_ACCOUNT = "financial_account", "Financial Account"
         OTHER = "other", "Other"
 
     feature_id = models.UUIDField(
@@ -54,6 +60,33 @@ class ExtractedFeature(models.Model):
 
     extracted_timestamp = models.DateTimeField(
         auto_now_add=True,
+    )
+
+    # --- Investigative metadata -----------------------------------------------
+    short_label = models.CharField(max_length=120, blank=True, default="")
+    category = models.CharField(max_length=50, blank=True, default="")
+    risk_level = models.CharField(max_length=20, blank=True, default="")
+    actor_role = models.CharField(max_length=50, blank=True, default="")
+    tags = models.JSONField(default=list, blank=True)
+    related_indicators = models.JSONField(default=list, blank=True)
+
+    # --- Source provenance (powers the frontend line-highlight hyperlink) -----
+    # The 1-based line numbers in the source page_text where this feature
+    # was extracted from. When the user clicks the source link in the UI,
+    # the frontend switches to code view and scrolls to + highlights these lines.
+    source_line_start = models.IntegerField(null=True, blank=True)
+    source_line_end = models.IntegerField(null=True, blank=True)
+    source_method = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="Extraction method: regex, regex_review, regex_vendor, llm, etc.",
+    )
+    page_type = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        help_text="Classified page type: PRODUCT_DETAIL, CATALOG_LISTING, GENERAL.",
     )
 
     def __str__(self):

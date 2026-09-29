@@ -5,6 +5,7 @@ import { getProjects } from "../api/projects";
 import {
     triggerCrawl,
     getCrawlStatus,
+    getCrawlLogs,
     stopCrawl,
 } from "../api/crawls";
 import api from "../api/axiosInstance";
@@ -210,9 +211,10 @@ const Project = () => {
     const [newOnionUrl, setNewOnionUrl] = useState("");
     const [addingDomain, setAddingDomain] = useState(false);
 
-    // Crawl state per domain: { [domainId]: { crawlId, status, elapsed, error } }
+    // Crawl state per domain
     const [crawlStates, setCrawlStates] = useState({});
     const pollRefs = useRef({});
+    const logScrollRef = useRef({});
 
     // Scraped pages modal
     const [inspectDomain, setInspectDomain] = useState(null);
@@ -324,47 +326,41 @@ const Project = () => {
                 },
             }));
 
-            // Poll every 2 seconds
-            const startTime = Date.now();
+            // Poll status + logs every 2 seconds
             pollRefs.current[domainId] = setInterval(async () => {
                 try {
-                    const s = await getCrawlStatus(crawlId);
-                    const elapsed = Math.round(
-                        (Date.now() - startTime) / 1000
-                    );
+                    const [s, logData] = await Promise.all([
+                        getCrawlStatus(crawlId),
+                        getCrawlLogs(crawlId, 80).catch(() => null),
+                    ]);
 
-                    if (
+                    const isDone =
                         s.status === "completed" ||
                         s.status === "failed" ||
-                        s.status === "cancelled"
-                    ) {
+                        s.status === "cancelled";
+
+                    setCrawlStates((prev) => ({
+                        ...prev,
+                        [domainId]: {
+                            ...prev[domainId],
+                            status: s.status,
+                            elapsed: s.elapsed_seconds || prev[domainId]?.elapsed || 0,
+                            estimated: s.estimated_seconds || prev[domainId]?.estimated || 0,
+                            pagesCollected: logData?.pages_collected ?? s.pages_collected ?? 0,
+                            entitiesExtracted: logData?.entities_extracted ?? s.entities_extracted ?? 0,
+                            currentUrl: logData?.current_url || null,
+                            logs: logData?.log_lines || [],
+                        },
+                    }));
+
+                    // Auto-scroll log panel
+                    const el = logScrollRef.current[domainId];
+                    if (el) el.scrollTop = el.scrollHeight;
+
+                    if (isDone) {
                         clearInterval(pollRefs.current[domainId]);
                         delete pollRefs.current[domainId];
-
-                        setCrawlStates((prev) => ({
-                            ...prev,
-                            [domainId]: {
-                                ...prev[domainId],
-                                status: s.status,
-                                elapsed,
-                                pagesScraped:
-                                    s.pages_scraped || 0,
-                            },
-                        }));
-
-                        // Refresh domains to get updated pages_count
                         await loadDomains();
-                    } else {
-                        setCrawlStates((prev) => ({
-                            ...prev,
-                            [domainId]: {
-                                ...prev[domainId],
-                                status: "running",
-                                elapsed,
-                                pagesScraped:
-                                    s.pages_scraped || 0,
-                            },
-                        }));
                     }
                 } catch {
                     // Polling error — keep going
@@ -701,53 +697,99 @@ const Project = () => {
                                                 <div className="mt-2 flex flex-wrap items-center gap-4 text-[10px] text-neutral-400">
                                                     <span>
                                                         ID:{" "}
-                                                        {domain.domain_id.slice(
-                                                            0,
-                                                            8
-                                                        )}
-                                                        ...
+                                                        {domain.domain_id.slice(0, 8)}...
                                                     </span>
                                                     <span>
-                                                        {domain.pages_count || 0}{" "}
-                                                        pages saved
+                                                        {domain.pages_count || 0}{" "}pages saved
                                                     </span>
 
                                                     {/* Live status badge */}
                                                     {isRunning && (
-                                                        <span className="inline-flex items-center gap-1 text-orange-600">
+                                                        <span className="inline-flex items-center gap-1 text-orange-600 font-bold">
                                                             <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-orange-500" />
-                                                            Crawling ·{" "}
-                                                            {cs.elapsed || 0}s
-                                                            {cs.pagesScraped
-                                                                ? ` · ${cs.pagesScraped} pages`
-                                                                : ""}
+                                                            Crawling · {cs.elapsed || 0}s
+                                                            {cs.pagesCollected > 0 && ` · ${cs.pagesCollected} pages`}
+                                                            {cs.entitiesExtracted > 0 && ` · ${cs.entitiesExtracted} entities`}
                                                         </span>
                                                     )}
-                                                    {cs.status ===
-                                                        "completed" && (
-                                                        <span className="text-green-600">
-                                                            ✓ Completed
-                                                            {cs.pagesScraped
-                                                                ? ` · ${cs.pagesScraped} pages`
-                                                                : ""}
+                                                    {cs.status === "completed" && (
+                                                        <span className="text-green-600 font-bold">
+                                                            ✓ Completed · {cs.pagesCollected || 0} pages · {cs.entitiesExtracted || 0} entities
                                                         </span>
                                                     )}
-                                                    {cs.status ===
-                                                        "failed" && (
-                                                        <span className="text-red-600">
-                                                            ✗ Failed
-                                                            {cs.error
-                                                                ? ` — ${cs.error}`
-                                                                : ""}
+                                                    {cs.status === "failed" && (
+                                                        <span className="text-red-600 font-bold">
+                                                            ✗ Failed{cs.error ? ` — ${cs.error}` : ""}
                                                         </span>
                                                     )}
-                                                    {cs.status ===
-                                                        "cancelled" && (
-                                                        <span className="text-neutral-500">
-                                                            ■ Stopped
-                                                        </span>
+                                                    {cs.status === "cancelled" && (
+                                                        <span className="text-neutral-500">■ Stopped</span>
                                                     )}
                                                 </div>
+
+                                                {/* ── Live Crawl Panel (running only) ── */}
+                                                {isRunning && (
+                                                    <div className="mt-3 border border-orange-200 bg-orange-50 rounded">
+                                                        {/* Progress bar */}
+                                                        {cs.estimated > 0 && (
+                                                            <div className="h-1 bg-orange-100 overflow-hidden">
+                                                                <div
+                                                                    className="h-full bg-orange-500 transition-all duration-1000"
+                                                                    style={{
+                                                                        width: `${Math.min(100, Math.round(((cs.elapsed || 0) / cs.estimated) * 100))}%`
+                                                                    }}
+                                                                />
+                                                            </div>
+                                                        )}
+
+                                                        <div className="px-3 py-2 space-y-1">
+                                                            {/* Stats row */}
+                                                            <div className="flex flex-wrap gap-4 text-[10px] font-mono">
+                                                                <span className="text-orange-700">
+                                                                    ⏱ {cs.elapsed || 0}s{cs.estimated > 0 ? ` / ~${cs.estimated}s` : ""}
+                                                                </span>
+                                                                <span className="text-blue-700">
+                                                                    📄 {cs.pagesCollected || 0} pages crawled
+                                                                </span>
+                                                                <span className="text-purple-700">
+                                                                    🧠 {cs.entitiesExtracted || 0} entities
+                                                                </span>
+                                                            </div>
+
+                                                            {/* Current URL */}
+                                                            {cs.currentUrl && (
+                                                                <div className="flex items-start gap-1 text-[10px] font-mono text-neutral-600">
+                                                                    <span className="shrink-0 text-green-600">▶</span>
+                                                                    <span className="break-all leading-tight">{cs.currentUrl}</span>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Log terminal */}
+                                                            {cs.logs && cs.logs.length > 0 && (
+                                                                <div
+                                                                    ref={(el) => { logScrollRef.current[domain.domain_id] = el; }}
+                                                                    className="mt-2 h-32 overflow-y-auto rounded bg-black px-2 py-1.5"
+                                                                >
+                                                                    {cs.logs.map((line, i) => (
+                                                                        <p
+                                                                            key={i}
+                                                                            className={
+                                                                                "font-mono text-[9px] leading-snug whitespace-pre-wrap break-all " +
+                                                                                (line.includes("ERROR") ? "text-red-400" :
+                                                                                line.includes("WARNING") ? "text-yellow-300" :
+                                                                                line.includes("Crawling") ? "text-green-400" :
+                                                                                line.includes("Scraped") ? "text-cyan-400" :
+                                                                                "text-neutral-400")
+                                                                            }
+                                                                        >
+                                                                            {line}
+                                                                        </p>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
 
                                             {/* Action buttons */}
@@ -791,6 +833,7 @@ const Project = () => {
                                                             state: {
                                                                 domainId: domain.domain_id,
                                                                 domainName: domain.domain_name,
+                                                                crawlId: cs.crawlId || null,
                                                             },
                                                         })
                                                     }

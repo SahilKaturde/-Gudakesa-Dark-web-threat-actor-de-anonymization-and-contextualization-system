@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional, TypedDict
 from langgraph.graph import StateGraph, END
 
 from .schemas import ExtractedEntityItem
-from .extractor import extract_features_with_llm
+from .extractor import extract_features_with_llm, CATEGORY_BY_TYPE, RISK_BY_TYPE
 from .database import SessionLocal
 from .models import ExtractedFeature, PageContent, CrawledDomain
 
@@ -41,12 +41,14 @@ def node_sanitize_text(state: ExtractionGraphState) -> ExtractionGraphState:
 
 
 def node_extract(state: ExtractionGraphState) -> ExtractionGraphState:
-    """Node 2: Call OpenRouter LangChain Gemini Flash extractor."""
+    """Node 2: Run hybrid regex + qwen3:1.7b extraction pipeline."""
     text = state.get("cleaned_text", "")
     if not text:
         return {**state, "extracted_items": [], "error": "No page text available for extraction."}
 
-    items = extract_features_with_llm(text)
+    # Pass page_id as filename so provenance records are identifiable
+    filename = f"{state.get('page_id', 'page')}.txt"
+    items = extract_features_with_llm(text, filename=filename)
     return {
         **state,
         "extracted_items": items
@@ -73,7 +75,19 @@ def node_validate_and_score(state: ExtractionGraphState) -> ExtractionGraphState
         item.confidence_score = score
         item.feature_value = item.feature_value.strip()
         item.context = item.context[:250].strip() if item.context else ""
-        item.description = item.description[:250].strip() if item.description else ""
+        # 250 chars was truncating the new 4-5 sentence analytical
+        # descriptions mid-sentence. 900 comfortably fits that length while
+        # still capping runaway output.
+        item.description = item.description[:900].strip() if item.description else ""
+
+        # Backstop investigative metadata if it's missing/empty — keeps older
+        # extraction paths (or a schema that hasn't picked up the new fields
+        # yet) from silently shipping nulls where a real value is trivial to
+        # infer from feature_type alone.
+        if hasattr(item, "category") and not getattr(item, "category", None):
+            item.category = CATEGORY_BY_TYPE.get(item.feature_type, "other")
+        if hasattr(item, "risk_level") and not getattr(item, "risk_level", None):
+            item.risk_level = RISK_BY_TYPE.get(item.feature_type, "low")
 
         validated.append(item)
 
@@ -81,6 +95,22 @@ def node_validate_and_score(state: ExtractionGraphState) -> ExtractionGraphState
         **state,
         "validated_items": validated
     }
+
+
+def _extra_metadata(item) -> Dict[str, Any]:
+    """
+    Pull investigative metadata fields off an extracted item safely.
+    Includes the new source provenance fields for line-level traceability.
+    """
+    out: Dict[str, Any] = {}
+    for field in (
+        "short_label", "category", "risk_level", "actor_role",
+        "tags", "related_indicators",
+        "source_line_start", "source_line_end", "source_method", "page_type",
+    ):
+        if hasattr(item, field) and hasattr(ExtractedFeature, field):
+            out[field] = getattr(item, field)
+    return out
 
 
 def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
@@ -110,6 +140,7 @@ def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
                 continue
 
             f_id = uuid.uuid4()
+            extra = _extra_metadata(item)
             record = ExtractedFeature(
                 feature_id=f_id,
                 domain_id=domain_id,
@@ -119,7 +150,8 @@ def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
                 context=item.context,
                 description=item.description,
                 confidence_score=item.confidence_score,
-                extracted_timestamp=now
+                extracted_timestamp=now,
+                **extra,
             )
             db.add(record)
             existing_keys.add(key)
@@ -133,7 +165,8 @@ def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
                 "context": item.context,
                 "description": item.description,
                 "confidence_score": item.confidence_score,
-                "extracted_timestamp": now.isoformat()
+                "extracted_timestamp": now.isoformat(),
+                **extra,
             })
 
         db.commit()
@@ -149,7 +182,8 @@ def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
                     "context": item.context or "",
                     "description": item.description or "",
                     "confidence_score": item.confidence_score,
-                    "extracted_timestamp": now.isoformat()
+                    "extracted_timestamp": now.isoformat(),
+                    **_extra_metadata(item),
                 })
 
     except Exception as e:
@@ -165,7 +199,8 @@ def node_persist(state: ExtractionGraphState) -> ExtractionGraphState:
                 "context": item.context or "",
                 "description": item.description or "",
                 "confidence_score": item.confidence_score,
-                "extracted_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "extracted_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                **_extra_metadata(item),
             }
             for item in items
         ]

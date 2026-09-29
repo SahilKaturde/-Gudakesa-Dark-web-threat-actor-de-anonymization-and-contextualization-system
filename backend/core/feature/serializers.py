@@ -15,5 +15,17 @@ class ExtractedFeatureSerializer(serializers.ModelSerializer):
             "description",
             "confidence_score",
             "extracted_timestamp",
+            # Investigative metadata
+            "short_label",
+            "category",
+            "risk_level",
+            "actor_role",
+            "tags",
+            "related_indicators",
+            # Source provenance — for frontend line-highlight
+            "source_line_start",
+            "source_line_end",
+            "source_method",
+            "page_type",
         ]
         read_only_fields = ["feature_id", "extracted_timestamp"]

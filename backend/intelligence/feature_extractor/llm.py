@@ -8,7 +8,7 @@ Env:
 import os
 import re
 import json
-from typing import Optional
+from typing import Any, Optional
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -17,13 +17,19 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 # ---------------------------------------------------------------------------
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"   # try "gemini-3.8-flash" if your key has it
 
+# Gemini 2.5 Flash supports up to ~1M input tokens and up to 65,536 output
+# tokens. We don't max that out (cost + latency), but we give the agent a
+# lot more room than the previous 8192-token ceiling so it can produce full,
+# unruncated CTI analysis instead of stopping mid-report.
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
+
 # ---------------------------------------------------------------------------
 # Gemini factory
 # ---------------------------------------------------------------------------
 def get_gemini_llm(
     model: str = DEFAULT_GEMINI_MODEL,
     temperature: float = 0.6,
-    max_tokens: int = 8192,
+    max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> Optional[ChatGoogleGenerativeAI]:
     """Return a Gemini client, or None if GOOGLE_API_KEY is missing."""
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -48,7 +54,48 @@ _THINK_PATTERNS = [
 ]
 
 
-def strip_think(text: str) -> str:
+def content_to_text(content: Any) -> str:
+    """Normalize a LangChain message's `.content` into a plain string.
+
+    THIS IS THE FIX FOR: "TypeError: expected string or bytes-like object,
+    got 'list'".
+
+    ChatGoogleGenerativeAI does NOT always return `.content` as a string.
+    Whenever Gemini emits a tool call alongside text (e.g. your chart tools),
+    or returns multi-part output, LangChain represents `.content` as a LIST
+    of parts instead, e.g.:
+        [{"type": "text", "text": "Here is the analysis..."}]
+    or even a mix of plain strings and dicts. Every place that used to run
+    regex directly on `response.content` (strip_think / extract_reasoning)
+    would crash with exactly the TypeError you saw, and chat.py's except
+    block silently swallowed it into a fake "Gemini unavailable" error —
+    even though Gemini had actually answered successfully.
+
+    Every caller that touches `.content` should route through here first.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # Common Gemini/LangChain part shapes.
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    # Last resort — never let a non-string reach a regex call.
+    return str(content)
+
+
+def strip_think(text: Any) -> str:
+    text = content_to_text(text)
     if not text:
         return ""
     out = text
@@ -57,7 +104,8 @@ def strip_think(text: str) -> str:
     return out.strip()
 
 
-def extract_reasoning(text: str) -> str:
+def extract_reasoning(text: Any) -> str:
+    text = content_to_text(text)
     if not text:
         return ""
     chunks = []

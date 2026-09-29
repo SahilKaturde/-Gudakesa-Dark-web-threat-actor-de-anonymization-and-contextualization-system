@@ -107,8 +107,18 @@ ASGI_APPLICATION = "config.asgi.application"
 # DATABASE
 # =============================================================================
 
+import os
+
+
 DATABASES = {
-    "default": env.db("DATABASE_URL"),
+    'default': {
+        'ENGINE': env('DB_ENGINE'),
+        'NAME': env('DB_NAME'),
+        'USER': env('DB_USER'),
+        'PASSWORD': env('DB_PASSWORD'),
+        'HOST': env('DB_HOST'),
+        'PORT': env('DB_PORT'),
+    }
 }
 
 

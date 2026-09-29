@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import api from "../api/axiosInstance";
 import { useAuth } from "../context/AuthContext";
+import { getCrawlPages } from "../api/crawls";
 
 function formatBytes(bytes) {
     if (!bytes && bytes !== 0) return "0 B";
@@ -161,6 +162,20 @@ const Playground = () => {
     const [featureFilter, setFeatureFilter] = useState("all");
     const [featureSearch, setFeatureSearch] = useState("");
     const [copiedFeatureId, setCopiedFeatureId] = useState(null);
+    const [highlightedLineRange, setHighlightedLineRange] = useState(null);
+
+    const handleJumpToLine = (startLine, endLine) => {
+        setViewMode("code");
+        setShowLineNumbers(true);
+        const range = { start: startLine, end: endLine || startLine };
+        setHighlightedLineRange(range);
+        setTimeout(() => {
+            const el = document.getElementById(`doc-line-${startLine}`);
+            if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+        }, 100);
+    };
 
     // AI Chat States
     const [aiInput, setAiInput] = useState("");
@@ -184,13 +199,34 @@ const Playground = () => {
         const fetchDomainAndPages = async () => {
             try {
                 setLoading(true);
-                const res = await api.get(`/domains/${domainId}/pages/`);
-                setPages(res.data);
-                if (res.data.length > 0) {
-                    setSelectedPageId(res.data[0].page_id);
-                    if (!domainName && res.data[0].page_url) {
+                // Get crawlId from location state or we can just fetch from Django domains first
+                // Wait, if we don't have crawlId, we can't fetch from crawler API.
+                // But the user gets here from Project.jsx which passes pages in location.state!
+                
+                let loadedPages = location.state?.pages || [];
+                
+                // If pages are passed but missing page_text (due to Django ingest failure), fetch from crawler API
+                if (loadedPages.length > 0 && !loadedPages[0].page_text && location.state?.crawlId) {
+                    try {
+                        const crawlerPages = await getCrawlPages(location.state.crawlId);
+                        if (crawlerPages && crawlerPages.length > 0) {
+                            loadedPages = crawlerPages;
+                        }
+                    } catch (e) {
+                        console.error("Failed to fetch pages from crawler API", e);
+                    }
+                } else if (loadedPages.length === 0) {
+                     // Fallback to Django if nothing was passed
+                     const res = await api.get(`/domains/${domainId}/pages/`);
+                     loadedPages = res.data;
+                }
+
+                setPages(loadedPages);
+                if (loadedPages.length > 0) {
+                    setSelectedPageId(loadedPages[0].page_id);
+                    if (!domainName && loadedPages[0].page_url) {
                         try {
-                            const u = new URL(res.data[0].page_url);
+                            const u = new URL(loadedPages[0].page_url);
                             setDomainName(u.hostname);
                         } catch {
                             setDomainName(domainId);
@@ -205,14 +241,7 @@ const Playground = () => {
             }
         };
 
-        if (!location.state?.pages || location.state.pages.length === 0) {
-            fetchDomainAndPages();
-        } else {
-            if (location.state.pages.length > 0) {
-                setSelectedPageId(location.state.pages[0].page_id);
-            }
-            setLoading(false);
-        }
+        fetchDomainAndPages();
     }, [domainId, location.state, domainName]);
 
     const activePage = useMemo(() => {
@@ -226,26 +255,55 @@ const Playground = () => {
             return;
         }
         const fetchFeatures = async () => {
+            let combinedFeatures = [];
+            
+            // Try crawler API first if we have crawlId (since it runs regex extractor locally)
+            if (location.state?.crawlId) {
+                try {
+                    const res = await fetch(`http://127.0.0.1:8001/crawls/${location.state.crawlId}/entities`);
+                    if (res.ok) {
+                        const entData = await res.json();
+                        // Find entities for this page
+                        const pageEnts = entData.find(e => e.url === activePage.page_url || e.page_id === activePage.page_id);
+                        if (pageEnts && pageEnts.entities) {
+                            // Map to UI format
+                            const mapped = pageEnts.entities.map(e => ({
+                                feature_id: Math.random().toString(36).substr(2, 9),
+                                feature_type: e.type,
+                                feature_value: e.value,
+                                context: e.context || "",
+                                source_method: "regex"
+                            }));
+                            combinedFeatures = [...combinedFeatures, ...mapped];
+                        }
+                    }
+                } catch (e) {
+                    console.log("Crawler API entities fetch failed", e);
+                }
+            }
+
             try {
                 const res = await fetch(
                     `${AI_SERVICE_URL}/api/v1/features?page_id=${activePage.page_id}`
                 );
                 if (res.ok) {
                     const data = await res.json();
-                    setExtractedFeatures(data);
+                    combinedFeatures = [...combinedFeatures, ...data];
                 }
             } catch (err) {
                 console.log("Failed to fetch features from AI service, falling back to Django API");
                 try {
                     const djangoRes = await api.get(`/features/?page=${activePage.page_id}`);
-                    setExtractedFeatures(djangoRes.data);
+                    combinedFeatures = [...combinedFeatures, ...djangoRes.data];
                 } catch (e) {
                     console.error("Failed to fetch features:", e);
                 }
             }
+            
+            setExtractedFeatures(combinedFeatures);
         };
         fetchFeatures();
-    }, [activePage]);
+    }, [activePage, location.state]);
 
     const handleExtractFeatures = async () => {
         if (!activePage) return;
@@ -909,11 +967,20 @@ const Playground = () => {
                                                     if (docSearch.trim() !== "" && !matchesSearch) {
                                                         return null;
                                                     }
+                                                    const isHighlighted =
+                                                        highlightedLineRange &&
+                                                        lineNumber >= highlightedLineRange.start &&
+                                                        lineNumber <= highlightedLineRange.end;
                                                     return (
                                                         <div
                                                             key={idx}
-                                                            className={`table-row hover:bg-neutral-50 transition-colors ${
-                                                                matchesSearch ? "bg-yellow-50 font-medium" : ""
+                                                            id={`doc-line-${lineNumber}`}
+                                                            className={`table-row transition-colors ${
+                                                                isHighlighted
+                                                                    ? "bg-amber-100/90 text-amber-950 font-semibold border-l-4 border-amber-500 shadow-xs"
+                                                                    : matchesSearch
+                                                                    ? "bg-yellow-50 font-medium hover:bg-yellow-100"
+                                                                    : "hover:bg-neutral-50"
                                                             }`}
                                                         >
                                                             {showLineNumbers && (
@@ -1082,21 +1149,47 @@ const Playground = () => {
                                 filteredExtractedFeatures.map((item, idx) => {
                                     const isCopied =
                                         copiedFeatureId === (item.feature_id || idx);
+                                    const isCardHighlighted =
+                                        highlightedLineRange &&
+                                        (item.source_line_start || item.source_line_start === 0) &&
+                                        highlightedLineRange.start === item.source_line_start;
                                     return (
                                         <div
                                             key={item.feature_id || idx}
-                                            className="rounded border border-neutral-200 bg-white p-3 shadow-xs hover:border-neutral-300 transition-colors"
+                                            className={`rounded border bg-white p-3 shadow-xs transition-colors ${
+                                                isCardHighlighted
+                                                    ? "border-amber-400 bg-amber-50/40 ring-1 ring-amber-400"
+                                                    : "border-neutral-200 hover:border-neutral-300"
+                                            }`}
                                         >
                                             <div className="flex items-center justify-between gap-2">
-                                                <span className="rounded bg-neutral-900 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-white">
-                                                    {item.feature_type}
-                                                </span>
+                                                <div className="flex items-center gap-1.5 flex-wrap">
+                                                    <span className="rounded bg-neutral-900 px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-white">
+                                                        {item.feature_type}
+                                                    </span>
+                                                    {item.risk_level && (
+                                                        <span className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase ${
+                                                            item.risk_level === "CRITICAL" ? "bg-red-100 text-red-800 border border-red-200" :
+                                                            item.risk_level === "HIGH" ? "bg-orange-100 text-orange-800 border border-orange-200" :
+                                                            item.risk_level === "MEDIUM" ? "bg-amber-100 text-amber-800 border border-amber-200" :
+                                                            "bg-slate-100 text-slate-700 border border-slate-200"
+                                                        }`}>
+                                                            {item.risk_level}
+                                                        </span>
+                                                    )}
+                                                </div>
                                                 {item.confidence_score !== undefined && (
                                                     <span className="font-mono text-[10px] text-neutral-500">
                                                         {Math.round((item.confidence_score || 0) * 100)}% Confidence
                                                     </span>
                                                 )}
                                             </div>
+
+                                            {item.short_label && (
+                                                <div className="mt-1.5 text-xs font-semibold text-neutral-800 truncate">
+                                                    {item.short_label}
+                                                </div>
+                                            )}
 
                                             <div className="mt-2 flex items-center justify-between gap-2">
                                                 <code className="font-mono text-xs font-bold text-neutral-900 break-all select-all">
@@ -1128,6 +1221,23 @@ const Playground = () => {
                                                 <p className="mt-1 text-[11px] text-neutral-500 italic">
                                                     {item.description}
                                                 </p>
+                                            )}
+
+                                            {(item.source_line_start || item.source_line_start === 0) && (
+                                                <div className="mt-2 flex items-center justify-between border-t border-neutral-100 pt-2 font-mono text-[10px]">
+                                                    <button
+                                                        onClick={() => handleJumpToLine(item.source_line_start, item.source_line_end)}
+                                                        className="inline-flex items-center gap-1.5 rounded border border-blue-200 bg-blue-50 px-2 py-1 font-bold text-blue-700 hover:bg-blue-100 transition-colors cursor-pointer"
+                                                        title="Click to jump to line in text view and highlight source range"
+                                                    >
+                                                        <span>📍 Line {item.source_line_start}{item.source_line_end && item.source_line_end !== item.source_line_start ? `-${item.source_line_end}` : ''}</span>
+                                                    </button>
+                                                    {item.source_method && (
+                                                        <span className="text-[9px] text-neutral-400 font-mono">
+                                                            {item.source_method}
+                                                        </span>
+                                                    )}
+                                                </div>
                                             )}
                                         </div>
                                     );

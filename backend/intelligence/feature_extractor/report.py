@@ -1,250 +1,168 @@
 """
-Investigation Report generation for GUDAKESA.
-Gemini-only. Falls back to a data-driven report if Gemini is unavailable or
-returns invalid JSON.
+extractor/report.py
+Generates structured intelligence deliverables:
+1. features.json - Machine-readable extraction data with provenance
+2. intel_report.md - Executive law enforcement investigation dossier
 """
+import json
 import datetime
-from typing import List, Dict
-from collections import Counter
-from dotenv import load_dotenv
-
-from langchain_core.messages import SystemMessage, HumanMessage
-
-from .llm import get_gemini_llm, parse_json_object, DEFAULT_GEMINI_MODEL
-
-load_dotenv()
+import pathlib
+from typing import Any, Dict, List
 
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
-REPORT_SYSTEM_PROMPT = """You are a senior Cyber Threat Intelligence analyst writing a formal investigation report.
-Generate a detailed CTI report for a dark web investigation. Be professional, precise and use CTI terminology.
-Your output MUST be valid JSON matching EXACTLY the schema provided — no markdown, no backticks, no prose around it.
-Return ONLY the raw JSON object."""
-
-REPORT_SCHEMA_DESCRIPTION = """{
-  "executive_summary": "2-3 sentence summary of findings",
-  "threat_level": "CRITICAL | HIGH | MEDIUM | LOW | INFORMATIONAL",
-  "threat_level_rationale": "1-2 sentence explanation of threat level",
-  "key_findings": ["finding 1", "finding 2", "..."],
-  "threat_actor_profile": {
-    "likely_motivation": "...",
-    "operational_security": "...",
-    "estimated_sophistication": "Nation-State | Advanced | Intermediate | Low-Level",
-    "indicators_of_attribution": ["indicator 1", "..."]
-  },
-  "ioc_analysis": {
-    "high_value": ["IOC value 1", "..."],
-    "notes": "Analysis notes on the IOCs"
-  },
-  "attack_vectors": ["vector 1", "..."],
-  "recommendations": ["action 1", "..."],
-  "investigative_leads": ["lead 1", "..."]
-}"""
-
-
-# ---------------------------------------------------------------------------
-# Fallback report builder (no LLM)
-# ---------------------------------------------------------------------------
-def _fallback_report(features: List[Dict], page_text: str) -> Dict:
-    """Build a structured report from extracted data without an LLM."""
-    by_type = Counter(f.get("feature_type", "other") for f in features)
-    high_conf = [f for f in features if (f.get("confidence_score") or 0) >= 0.85]
-    has_crypto = by_type.get("crypto_wallet", 0) > 0
-    has_email = by_type.get("email", 0) > 0
-    has_pgp = by_type.get("pgp_key", 0) > 0
-
-    threat_level = "INFORMATIONAL"
-    if len(features) > 20 or has_crypto or has_pgp:
-        threat_level = "HIGH"
-    elif len(features) > 10:
-        threat_level = "MEDIUM"
-    elif len(features) > 0:
-        threat_level = "LOW"
-
-    key_findings: List[str] = []
-    if has_crypto:
-        key_findings.append(
-            f"Cryptocurrency wallets detected ({by_type['crypto_wallet']}), "
-            f"indicating financial transaction activity."
-        )
-    if has_email:
-        key_findings.append(
-            f"Email addresses identified ({by_type['email']}), "
-            f"potentially linked to threat actor communications."
-        )
-    if by_type.get("username", 0):
-        key_findings.append(
-            f"Forum usernames/aliases extracted ({by_type['username']}), "
-            f"useful for cross-platform correlation."
-        )
-    if by_type.get("ip", 0):
-        key_findings.append(
-            f"IP addresses present ({by_type['ip']}), may indicate "
-            f"infrastructure or server hosting."
-        )
-    if has_pgp:
-        key_findings.append(
-            f"PGP public keys found ({by_type['pgp_key']}), strong identity "
-            f"anchor for attribution."
-        )
-    if by_type.get("onion_url", 0):
-        key_findings.append(
-            f"Onion URLs extracted ({by_type['onion_url']}), useful for "
-            f"infrastructure mapping."
-        )
-    if not key_findings:
-        key_findings = ["Document analyzed. Insufficient pattern matches for automated key findings."]
-
-    return {
-        "executive_summary": (
-            f"Analysis of the target document identified {len(features)} threat indicators "
-            f"across {len(by_type)} categories. "
-            + ("Cryptocurrency activity and " if has_crypto else "")
-            + (
-                "communication identifiers suggest active threat actor operations."
-                if features else "No high-confidence indicators were found."
-            )
-        ),
-        "threat_level": threat_level,
-        "threat_level_rationale": (
-            f"Based on {len(features)} extracted indicators across "
-            f"{len(by_type)} categories."
-        ),
-        "key_findings": key_findings,
-        "threat_actor_profile": {
-            "likely_motivation": "Unknown — insufficient data for automated attribution.",
-            "operational_security": "Indeterminate from available data.",
-            "estimated_sophistication": "Unknown",
-            "indicators_of_attribution": [f["feature_value"] for f in high_conf[:5]],
-        },
-        "ioc_analysis": {
-            "high_value": [f["feature_value"] for f in high_conf[:10]],
-            "notes": f"Auto-generated from {len(high_conf)} high-confidence (≥0.85) indicators.",
-        },
-        "attack_vectors": ["Dark web forum/marketplace activity detected."],
-        "recommendations": [
-            "Cross-reference extracted usernames against known threat actor databases.",
-            "Block identified crypto wallets on exchange watch-lists.",
-            "Report email addresses to threat intelligence sharing platforms (ISACs).",
-            "Escalate to senior analyst for manual review.",
-        ],
-        "investigative_leads": (
-            [f"Pivot on {f['feature_type']}: {f['feature_value']}" for f in high_conf[:5]]
-            or ["No high-confidence leads automatically identified."]
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# LLM-backed report builder
-# ---------------------------------------------------------------------------
-def _auto_generate_report_data(
-    domain_id: str,
-    page_id: str,
-    page_text: str,
-    features: List[Dict],
-) -> Dict:
-    """Ask Gemini for a structured report. Falls back to computed report on failure."""
-    by_type = Counter(f.get("feature_type", "other") for f in features)
-    high_conf = [f for f in features if (f.get("confidence_score") or 0) >= 0.9]
-
-    feature_summary = "\n".join(
-        f"  [{k.upper()}] {v} found" for k, v in by_type.items()
-    ) or "  (none)"
-
-    hc_summary = "\n".join(
-        f"  - [{f['feature_type']}] {f['feature_value']}" for f in high_conf[:10]
-    ) or "  (none)"
-
-    prompt_text = f"""INVESTIGATION TARGET:
-  Domain ID: {domain_id}
-  Page ID:   {page_id}
-  Document size: {len(page_text)} characters
-
-EXTRACTED INDICATORS:
-{feature_summary}
-
-HIGH-CONFIDENCE INDICATORS (≥0.90):
-{hc_summary}
-
-DOCUMENT EXCERPT (first 2500 chars):
-{page_text[:2500]}
-
-Write a formal CTI investigation report as JSON matching this schema:
-{REPORT_SCHEMA_DESCRIPTION}
-"""
-
-    llm = get_gemini_llm(temperature=0.2, max_tokens=2048)
-    if not llm:
-        print("[Report] GOOGLE_API_KEY not set — using fallback report.")
-        return _fallback_report(features, page_text)
-
-    try:
-        response = llm.invoke([
-            SystemMessage(content=REPORT_SYSTEM_PROMPT),
-            HumanMessage(content=prompt_text),
-        ])
-        text = getattr(response, "content", "") or ""
-        parsed = parse_json_object(text)
-
-        if parsed:
-            print(f"[Report] Parsed JSON via gemini:{DEFAULT_GEMINI_MODEL}")
-            return parsed
-
-        print("[Report] Gemini returned non-JSON; using fallback report.")
-        return _fallback_report(features, page_text)
-
-    except Exception as e:
-        print(f"[Report] Gemini failed: {type(e).__name__}: {str(e)[:200]}")
-        return _fallback_report(features, page_text)
-
-
-# ---------------------------------------------------------------------------
-# Public entrypoint
-# ---------------------------------------------------------------------------
-def generate_investigation_report(
-    domain_id: str,
-    page_id: str,
-    page_url: str,
-    page_name: str,
-    page_text: str,
-    features: List[Dict],
-) -> Dict:
-    """
-    Full report generation pipeline.
-    Returns a complete structured report dict ready for frontend rendering.
-    """
-    now = datetime.datetime.now(datetime.timezone.utc)
-    by_type = Counter(f.get("feature_type", "other") for f in features)
-
-    llm_data = _auto_generate_report_data(domain_id, page_id, page_text, features)
-
-    return {
+def save_json_report(
+    pages: List[Dict[str, Any]],
+    aggregation: Dict[str, Any],
+    output_dir: pathlib.Path,
+    source_folder: str,
+) -> pathlib.Path:
+    """Export comprehensive JSON intelligence deliverable."""
+    report = {
         "metadata": {
-            "report_id": f"GDK-{now.strftime('%Y%m%d-%H%M%S')}",
-            "generated_at": now.isoformat(),
-            "classification": "TLP:AMBER — For authorized analyst use only",
-            "analyst_system": "GUDAKESA AI CTI Platform v1.0",
-            "domain_id": domain_id,
-            "page_id": page_id,
-            "page_url": page_url,
-            "page_name": page_name,
-            "document_size_chars": len(page_text),
-            "total_indicators": len(features),
+            "source_folder": str(source_folder),
+            "total_files_processed": len(pages),
+            "extraction_timestamp": datetime.datetime.now().isoformat(),
+            "pipeline_version": "1.1.0",
         },
-        "statistics": {
-            "by_type": dict(by_type),
-            "high_confidence_count": sum(
-                1 for f in features if (f.get("confidence_score") or 0) >= 0.85
-            ),
-            "avg_confidence": round(
-                sum(f.get("confidence_score") or 0.7 for f in features)
-                / max(len(features), 1),
-                3,
-            ),
+        "investigation_summary": {
+            "product_detail_pages": sum(1 for p in pages if p.get("page_type") == "PRODUCT_DETAIL"),
+            "catalog_listing_pages": sum(1 for p in pages if p.get("page_type") == "CATALOG_LISTING"),
+            "general_pages": sum(1 for p in pages if p.get("page_type") == "GENERAL"),
+            "total_unique_vendors": len(aggregation.get("vendor_dossiers", {})),
+            "total_unique_reviewers": len(aggregation.get("user_profiles", {})),
+            "total_reviews_extracted": sum(len(p.get("reviews") or []) for p in pages),
         },
-        "indicators": features,
-        "analysis": llm_data,
+        "vendor_dossiers": aggregation.get("vendor_dossiers", {}),
+        "user_profiles": aggregation.get("user_profiles", {}),
+        "pages": pages,
     }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "features.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+
+    return out_path
+
+
+def save_markdown_report(
+    pages: List[Dict[str, Any]],
+    aggregation: Dict[str, Any],
+    output_dir: pathlib.Path,
+    source_folder: str,
+) -> pathlib.Path:
+    """Export executive markdown intelligence brief."""
+    lines = []
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    product_pages = [p for p in pages if p.get("page_type") == "PRODUCT_DETAIL"]
+    catalog_pages = [p for p in pages if p.get("page_type") == "CATALOG_LISTING"]
+    general_pages = [p for p in pages if p.get("page_type") == "GENERAL"]
+
+    vendors = aggregation.get("vendor_dossiers", {})
+    users = aggregation.get("user_profiles", {})
+    total_reviews = sum(len(p.get("reviews") or []) for p in pages)
+
+    lines.append("# 🕵️ DARKWEB INTELLIGENCE REPORT")
+    lines.append(f"**Target Directory:** `{source_folder}`  ")
+    lines.append(f"**Generated:** {now}  ")
+    lines.append(f"**Classification:** LAW ENFORCEMENT SENSITIVE  ")
+    lines.append("")
+
+    # 1. Executive Summary
+    lines.append("## 1. Executive Summary")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| **Scraped Files Processed** | `{len(pages)}` |")
+    lines.append(f"| **Product Detail Pages** | `{len(product_pages)}` |")
+    lines.append(f"| **Catalog / Listing Pages** | `{len(catalog_pages)}` |")
+    lines.append(f"| **General / Policy / FAQ Pages** | `{len(general_pages)}` |")
+    lines.append(f"| **Distinct Vendors Identified** | `{len(vendors)}` |")
+    lines.append(f"| **Customer Reviews Extracted** | `{total_reviews}` |")
+    lines.append(f"| **Unique Reviewers Profiled** | `{len(users)}` |")
+    lines.append("")
+
+    # 2. Vendor Dossiers (Deduplicated)
+    lines.append("## 2. Vendor & Marketplace Dossiers")
+    if vendors:
+        for name, vdata in sorted(vendors.items(), key=lambda x: x[1].get("product_count", 0), reverse=True):
+            v_type = vdata.get("vendor_type", "vendor").replace("_", " ").title()
+            rating_str = f" ⭐ {vdata['rating']}/5" if vdata.get("rating") else ""
+            lines.append(f"### 🏷️ {name} ({v_type}){rating_str}")
+            lines.append(f"- **Distinct Products Identified:** {vdata.get('product_count', 0)}")
+            if vdata.get("categories"):
+                lines.append(f"- **Categories:** {', '.join(vdata['categories'])}")
+            if vdata.get("crypto_accepted"):
+                lines.append(f"- **Payment / Crypto Accepted:** {', '.join(vdata['crypto_accepted'])}")
+            if vdata.get("contacts"):
+                contacts_str = ", ".join(f"{k}: `{v}`" for k, v in vdata["contacts"].items())
+                lines.append(f"- **Contact Handles:** {contacts_str}")
+            lines.append(f"- **Observed across {len(vdata.get('pages_found_on', []))} page(s):** `{', '.join(vdata.get('pages_found_on', [])[:8])}`")
+            lines.append("")
+
+            prods = vdata.get("unique_products", [])
+            if prods:
+                lines.append("| Product Name | Price | Occurrences | Seen In Pages |")
+                lines.append("|---|---|---|---|")
+                for p in prods[:20]:
+                    seen_str = ", ".join(p.get("found_in_pages", [])[:3])
+                    lines.append(f"| {p.get('title', 'N/A')} | {p.get('price', 'N/A')} | {p.get('occurrence_count', 1)} | `{seen_str}` |")
+                lines.append("")
+    else:
+        lines.append("_No explicit vendor labels found._\n")
+
+    # 3. User / Reviewer Profiles
+    lines.append("## 3. User & Reviewer Profiles")
+    if users:
+        sorted_users = sorted(users.items(), key=lambda x: x[1].get("total_reviews", 0), reverse=True)
+        for uname, udata in sorted_users[:30]:
+            avg_str = f", Avg Rating: {udata['avg_rating_given']}/5" if udata.get("avg_rating_given") else ""
+            lines.append(f"### 👤 `{uname}` ({udata['total_reviews']} review(s){avg_str})")
+            for pr in udata.get("products_reviewed", [])[:5]:
+                r = f"⭐ [{pr.get('rating', '?')}/5]" if pr.get("rating") else ""
+                comm = pr.get('comment', '').replace('\n', ' ')
+                dt = pr.get('date', 'Unknown')
+                f_src = pr.get('file', '')
+                p_name = pr.get('product', '?')
+                lines.append(f"- **{p_name}** {r} ({dt}): '_{comm}_' (File: `{f_src}`)")
+            lines.append("")
+    else:
+        lines.append("_No user reviews detected on these pages._\n")
+
+    # 4. Per-Page Details
+    lines.append("## 4. Per-Page Extracted Intelligence")
+    for page in pages:
+        fname = page.get("file", "unknown")
+        ptype = page.get("page_type", "GENERAL")
+        summary = page.get("summary", "")
+        icon = {"PRODUCT_DETAIL": "📦", "CATALOG_LISTING": "📋", "GENERAL": "📄"}.get(ptype, "📄")
+
+        lines.append(f"### {icon} `{fname}` — `{ptype}`")
+        if summary:
+            lines.append(f"> **Summary:** {summary}\n")
+
+        prod = page.get("product")
+        if prod and prod.get("title"):
+            prices = prod.get("prices") or {}
+            p_val = prices.get("current") or prices.get("listed") or "N/A"
+            lines.append(f"- **Product:** **{prod['title']}** (${p_val})")
+            if prod.get("category"):
+                lines.append(f"- **Category:** {prod['category']}")
+            if prod.get("overall_rating"):
+                lines.append(f"- **Rating:** {prod['overall_rating']}/5 ({prod.get('review_count', 0)} reviews)")
+
+        revs = page.get("reviews") or []
+        if revs:
+            lines.append(f"- **Customer Reviews ({len(revs)}):**")
+            for r in revs[:3]:
+                r_rating = f"[{r.get('rating')}/5]" if r.get('rating') else ""
+                lines.append(f"  • **{r.get('author')}** {r_rating} ({r.get('date')}): _{r.get('comment','')[:80]}_")
+
+        lines.append("")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "intel_report.md"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return out_path

@@ -53,6 +53,16 @@ export async function stopCrawl(crawlId) {
     return res.json();
 }
 
+/**
+ * GET /crawls/{crawl_id}/logs?last_n=N
+ * Returns live Scrapy log lines + current_url + pages_collected + elapsed_seconds.
+ */
+export async function getCrawlLogs(crawlId, lastN = 50) {
+    const res = await fetch(`${CRAWL_BASE}/crawls/${crawlId}/logs?last_n=${lastN}`);
+    if (!res.ok) throw new Error("Failed to fetch crawl logs");
+    return res.json();
+}
+
 /** GET /crawls/{crawl_id}/pages - Get raw scraped pages from crawler */
 export async function getCrawlPages(crawlId) {
     const res = await fetch(`${CRAWL_BASE}/crawls/${crawlId}/pages`);

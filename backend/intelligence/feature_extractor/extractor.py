@@ -1,438 +1,617 @@
 """
-Feature extractor for GUDAKESA Intelligence Feature Extractor.
-Gemini + hardened regex + validation pipeline.
+intelligence/feature_extractor/extractor.py
 
-Tiers:
-  1. Gemini (structured output, few-shot)
-  2. Regex (validated, deduped, false-positive filtered)
+Hybrid Regex + Ollama (qwen3:1.7b) intelligence extraction pipeline
+for law enforcement and investigative profiling of dark web (.onion) markets.
 
-Entity types emitted:
-  Syntactic (regex-capable): email, ip, crypto_wallet, pgp_key, onion_url,
-                              username, xmpp
-  Semantic  (Gemini only)  : product, post, review, other
+Architecture:
+  1. TextLoader  — line-indexed access, boilerplate detection
+  2. Classifier  — PRODUCT_DETAIL | CATALOG_LISTING | GENERAL
+  3. Structured extractors:
+       - product   → title, prices, specs, tags, sku, availability
+       - vendor    → name, rating, contacts, crypto accepted
+       - reviews   → author, rating, date, comment
+       - catalog   → product cards from listing pages
+       - sidebar   → categories, recent comments, top vendors
+  4. Regex-pattern extraction — onion URLs, BTC/XMR wallets, emails,
+       PGP keys, Telegram handles, XMPP addresses (applied across all pages)
+  5. Ollama fallback (qwen3:1.7b) — only when regex yields < MIN_FEATURES_REGEX
+  6. Summarizer — 2-sentence LLM or rich template summary
+
+Every extracted item carries:
+  source_line_start / source_line_end — 1-based line numbers into the raw page
+  source_method                        — "regex", "regex_review", "regex_vendor",
+                                         "regex_archive", "regex_card", "llm"
+  confidence_score
+  feature_type / feature_value / context / description
 """
 import re
-from typing import List, Dict, Set, Tuple, Iterable
+import io
+from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.prompts import ChatPromptTemplate
-
-from .llm import get_gemini_llm, DEFAULT_GEMINI_MODEL
-from .schemas import ExtractedFeatureBatch, ExtractedEntityItem
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-GEMINI_DOC_CHARS = 24000
-
-
-# ---------------------------------------------------------------------------
-# Regex patterns
-# ---------------------------------------------------------------------------
-# NOTE ON ORDER: more specific patterns must come before looser ones when
-# they overlap (e.g. onion-email before generic email; armored PGP block
-# before bare fingerprint).
-REGEX_PATTERNS: List[Tuple[str, str, float]] = [
-
-    # --- Emails -----------------------------------------------------------
-    # .onion-email first so it wins over the generic TLD rule
-    ("email", r'[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,255}\.onion\b', 0.98),
-    ("email", r'(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@'
-              r'(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.){1,4}'
-              r'[A-Za-z]{2,24}(?![A-Za-z0-9\-])', 0.95),
-
-    # --- Onion URLs -------------------------------------------------------
-    ("onion_url", r'\bhttps?://[a-z2-7]{16,56}\.onion(?:[/A-Za-z0-9\-\.\?=&%#_~]*)?', 0.99),
-    ("onion_url", r'\b[a-z2-7]{56}\.onion\b', 0.97),
-    ("onion_url", r'\b[a-z2-7]{16}\.onion\b', 0.92),
-
-    # --- IPv4 (each octet 0-255) ------------------------------------------
-    ("ip", r'\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}'
-           r'(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b', 0.92),
-
-    # --- Crypto wallets ---------------------------------------------------
-    # Bitcoin bech32 (bc1q…42 chars, bc1p…62 chars)
-    ("crypto_wallet", r'\bbc1[ac-hj-np-z02-9]{11,71}\b', 0.98),
-    # Bitcoin legacy / P2SH
-    ("crypto_wallet", r'\b[13][1-9A-HJ-NP-Za-km-z]{25,34}\b', 0.97),
-    # Ethereum
-    ("crypto_wallet", r'\b0x[a-fA-F0-9]{40}\b', 0.98),
-    # Monero standard (95 chars, starts '4') and subaddress (starts '8')
-    ("crypto_wallet", r'\b[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b', 0.98),
-    # Litecoin bech32 + legacy
-    ("crypto_wallet", r'\bltc1[ac-hj-np-z02-9]{11,71}\b', 0.98),
-    ("crypto_wallet", r'\b[LM][1-9A-HJ-NP-Za-km-z]{26,33}\b', 0.95),
-    # Dogecoin
-    ("crypto_wallet", r'\bD[5-9A-HJ-NP-U][1-9A-HJ-NP-Za-km-z]{32}\b', 0.95),
-    # Zcash transparent (t1… / t3…)
-    ("crypto_wallet", r'\bt[13][1-9A-HJ-NP-Za-km-z]{33}\b', 0.90),
-    # TRON
-    ("crypto_wallet", r'\bT[1-9A-HJ-NP-Za-km-z]{33}\b', 0.90),
-
-    # --- PGP --------------------------------------------------------------
-    # Full armored public key block — highest-confidence signal there is
-    ("pgp_key", r'-----BEGIN PGP PUBLIC KEY BLOCK-----'
-                r'[\s\S]{50,}?'
-                r'-----END PGP PUBLIC KEY BLOCK-----', 0.99),
-    # Fingerprint, only when explicitly labeled
-    ("pgp_key", r'(?:fingerprint|fpr|key[\s\-]?id)[\s:=\-]*'
-                r'((?:[0-9A-Fa-f]{4}[\s:]*){9,15}[0-9A-Fa-f]{4})', 0.90),
-
-    # --- Usernames --------------------------------------------------------
-    # Profile-style URL paths
-    ("username", r'/(?:user|users|profile|profiles|vendor|vendors|member|members|u)/'
-                 r'([A-Za-z0-9_\-\.]{3,32})(?![A-Za-z0-9_\-\.])', 0.90),
-    # Messaging-app usernames (Telegram, Wickr, Session, Signal, Threema)
-    ("username",
-     r'(?:telegram|tg|wickr|wickrme|session|signal|threema|tox)'
-     r'[\s:_\-]*(?:id|user|handle)?[\s:_\-]*'
-     r'@?([A-Za-z][A-Za-z0-9_\.\-]{3,31})(?![A-Za-z0-9_\-\.])', 0.90),
-    # Generic @-handle — guarded against emails by lookbehind + post-filter
-    ("username", r'(?<![A-Za-z0-9._%+\-])@([A-Za-z][A-Za-z0-9_]{3,31})\b', 0.82),
-
-    # --- XMPP / Jabber ----------------------------------------------------
-    ("xmpp", r'\b[A-Za-z0-9._%+\-]{1,64}@'
-             r'(?:jabber\.[A-Za-z]{2,}|xmpp\.[A-Za-z]{2,}|'
-             r'[A-Za-z0-9\-]+\.(?:im|chat|jabber|onion))\b', 0.90),
-]
-
+from .loader import TextLoader
+from .classifier import classify_page, PageType
+from .extractors.product import extract_product
+from .extractors.review import extract_reviews
+from .extractors.vendor import extract_vendor, extract_top_vendors_sidebar
+from .extractors.catalog import extract_catalog
+from .extractors.sidebar import extract_sidebar
+from . import patterns as pat
+from .config import MIN_FEATURES_REGEX
+from .llm.client import is_ollama_available
+from .llm.fallback_extractor import llm_fallback_extract
+from .summarizer import summarize_page
+from .schemas import ExtractedEntityItem
 
 # ---------------------------------------------------------------------------
-# Validation helpers
+# Investigative metadata lookups
 # ---------------------------------------------------------------------------
-_IP_OCTET_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
-_HEX_RE = re.compile(r'^[0-9A-Fa-f]+$')
+CATEGORY_BY_TYPE: Dict[str, str] = {
+    "email": "communication",
+    "xmpp": "communication",
+    "phone": "communication",
+    "username": "identity",
+    "pgp_key": "identity",
+    "ip": "infrastructure",
+    "onion_url": "infrastructure",
+    "crypto_wallet": "financial",
+    "financial_account": "financial",
+    "product": "activity",
+    "post": "activity",
+    "review": "activity",
+    "other": "other",
+}
 
-# Common domain suffixes that look like @-handles when someone writes "foo@gmail"
-_HANDLE_BLACKLIST: Set[str] = {
-    "gmail", "yahoo", "outlook", "hotmail", "protonmail", "proton",
-    "aol", "icloud", "mail", "yandex", "zoho", "gmx", "tutanota",
-    "tuta", "fastmail", "hushmail", "riseup", "onionmail", "mail2tor",
+RISK_BY_TYPE: Dict[str, str] = {
+    "crypto_wallet": "high",
+    "financial_account": "high",
+    "pgp_key": "medium",
+    "email": "medium",
+    "phone": "medium",
+    "onion_url": "medium",
+    "ip": "medium",
+    "username": "low",
+    "xmpp": "low",
+    "product": "low",
+    "post": "low",
+    "review": "low",
+    "other": "low",
+}
+
+# Short descriptions used for the description field on regex-only hits
+_TYPE_LABEL: Dict[str, str] = {
+    "email": "an email address",
+    "username": "a handle, alias, or account identifier",
+    "ip": "an IPv4 address",
+    "crypto_wallet": "a cryptocurrency wallet address",
+    "financial_account": "a bank account number (IBAN format, checksum-verified)",
+    "pgp_key": "a PGP public key or fingerprint",
+    "onion_url": "a Tor (.onion) hidden-service address",
+    "xmpp": "an XMPP/Jabber address",
+    "phone": "a phone number or phone-linked messaging contact",
 }
 
 
-def _is_valid_ip(v: str) -> bool:
-    if not _IP_OCTET_RE.match(v):
-        return False
-    try:
-        return all(0 <= int(p) <= 255 for p in v.split("."))
-    except ValueError:
-        return False
+# ---------------------------------------------------------------------------
+# In-memory TextLoader (no file required — works from DB page_text)
+# ---------------------------------------------------------------------------
 
+class InMemoryTextLoader(TextLoader):
+    """TextLoader subclass that accepts a raw string instead of a file path."""
 
-def _is_valid_pgp_fingerprint(v: str) -> bool:
-    """40-char (v4) or 64-char (v5) hex, ignoring whitespace/colons."""
-    compact = re.sub(r'[\s:]', '', v)
-    return len(compact) in (40, 64) and bool(_HEX_RE.match(compact))
-
-
-def _is_blacklisted_handle(v: str) -> bool:
-    return v.lower() in _HANDLE_BLACKLIST
+    def __init__(self, text: str, filename: str = "page.txt"):
+        # Bypass file reading — inject text directly
+        import pathlib
+        self.file_path = pathlib.Path(filename)
+        self.filename = filename
+        self._raw_text = text
+        self._lines: List[str] = text.splitlines()
+        self._core_start: int = 0
+        self._core_end: int = len(self._lines)
+        self._detect_boilerplate()
 
 
 # ---------------------------------------------------------------------------
-# Post-processing
+# Feature count helper
 # ---------------------------------------------------------------------------
-def _normalize(feature_type: str, value: str) -> str:
-    """Canonicalize a value by type. Returns '' if it should be dropped."""
-    v = value.strip().strip('.,;:"\')')
-    if not v:
-        return ""
 
-    if feature_type in ("email", "xmpp", "username", "onion_url"):
-        # Preserve original case for usernames (handles are case-sensitive in some apps)
-        if feature_type == "username":
-            return v
-        return v.lower()
+def count_features(features: Dict[str, Any]) -> int:
+    """Count extracted features to assess confidence."""
+    count = 0
+    product = features.get("product")
+    if product and isinstance(product, dict):
+        if product.get("title"):
+            count += 1
+        if product.get("prices"):
+            count += 1
+        if product.get("category") or product.get("category_path"):
+            count += 1
+        if product.get("specs"):
+            count += 1
+        if product.get("tags"):
+            count += 1
 
-    if feature_type == "ip":
-        return v  # digits + dots only
+    vendor = features.get("vendor")
+    if vendor and isinstance(vendor, dict) and vendor.get("name"):
+        count += 1
 
-    if feature_type == "crypto_wallet":
-        # Wallet case matters for base58 (BTC/XMR/etc.), lowercase for bech32/hex
-        if v.startswith(("bc1", "ltc1", "0x")):
-            return v.lower()
-        return v
-
-    if feature_type == "pgp_key":
-        # For armored blocks keep as-is; for fingerprints compact whitespace
-        if v.startswith("-----BEGIN"):
-            return v
-        return re.sub(r'[\s:]', '', v).upper()
-
-    return v
+    count += len(features.get("reviews") or [])
+    count += len(features.get("catalog_products") or [])
+    return count
 
 
-def _validate(feature_type: str, value: str) -> bool:
-    """Final gate — reject anything that fails type-specific validation."""
-    if not value:
-        return False
+# ---------------------------------------------------------------------------
+# Description builder (no LLM call — deterministic analytical write-up)
+# ---------------------------------------------------------------------------
 
-    if feature_type == "ip":
-        return _is_valid_ip(value)
-
-    if feature_type == "pgp_key" and not value.startswith("-----BEGIN"):
-        return _is_valid_pgp_fingerprint(value)
-
-    if feature_type == "username":
-        if _is_blacklisted_handle(value):
-            return False
-        # Reject pure-hex 32+ char strings (likely txids / hashes)
-        if len(value) >= 32 and _HEX_RE.match(value):
-            return False
-
-    if feature_type == "crypto_wallet":
-        # Reject obvious non-addresses
-        if len(value) < 26:
-            return False
-
-    return True
+def _make_description(f_type: str, value: str, snippet: str, method: str) -> str:
+    label = _TYPE_LABEL.get(f_type, "a threat indicator")
+    clean_snippet = snippet.replace('"', "'")[:160]
+    tier = "regex pattern matching" if method != "llm" else "the local qwen3:1.7b LLM"
+    return (
+        f"Deterministic {tier} identified '{value}' as {label}, "
+        f"extracted from: \"{clean_snippet}\". "
+        f"This indicator was flagged by the {tier.split()[0]} tier so the confidence score "
+        f"reflects format/structural validity rather than semantic judgment. "
+        f"Treat this as a reliable literal occurrence — cross-reference against other pages "
+        f"in the same domain to determine whether it recurs, which substantially raises "
+        f"its investigative significance."
+    )
 
 
-def _strip_emails_from(text: str, emails: Iterable[str]) -> str:
-    """Blank out detected emails so generic @-handle patterns don't re-match."""
-    out = text
-    for e in emails:
-        if e:
-            out = out.replace(e, " " * len(e))
-    return out
+# ---------------------------------------------------------------------------
+# Structured features → flat ExtractedEntityItem list
+# ---------------------------------------------------------------------------
 
-
-def _dedupe(items: List[ExtractedEntityItem]) -> List[ExtractedEntityItem]:
+def _flatten_structured(
+    structured: Dict[str, Any],
+    loader: InMemoryTextLoader,
+) -> List[ExtractedEntityItem]:
     """
-    Case-insensitive dedupe, keeping the highest-confidence variant.
-    Preserves first-seen order otherwise.
+    Convert the rich structured extraction output (product, vendor, reviews,
+    catalog, sidebar) into the flat list of ExtractedEntityItem that the rest
+    of the GUDAKESA pipeline (graph.py → persist) expects.
+
+    Every item carries source_line_start/end so the frontend can highlight.
     """
-    best: Dict[Tuple[str, str], ExtractedEntityItem] = {}
-    order: List[Tuple[str, str]] = []
+    items: List[ExtractedEntityItem] = []
+    page_type = structured.get("page_type", "GENERAL")
 
-    for it in items:
-        key = (it.feature_type.lower(), it.feature_value.lower())
-        if key not in best:
-            best[key] = it
-            order.append(key)
-        else:
-            if (it.confidence_score or 0) > (best[key].confidence_score or 0):
-                best[key] = it
-
-    return [best[k] for k in order]
-
-
-# ---------------------------------------------------------------------------
-# Regex extractor
-# ---------------------------------------------------------------------------
-def regex_fallback_extractor(text: str) -> List[ExtractedEntityItem]:
-    """
-    Rule-based extraction with validation and de-duplication.
-    Strong enough to be the guaranteed tier — but no semantic extraction.
-    """
-    if not text:
-        return []
-
-    raw: List[ExtractedEntityItem] = []
-    seen_values_by_type: Dict[str, Set[str]] = {}
-
-    # Pre-pass: collect emails so we can blank them before @-handle scanning
-    email_pat = re.compile(REGEX_PATTERNS[1][1])
-    detected_emails = [m.group(0) for m in email_pat.finditer(text)]
-    scrubbed = _strip_emails_from(text, detected_emails)
-
-    for f_type, pattern, base_score in REGEX_PATTERNS:
-        try:
-            target = scrubbed if f_type in ("username",) else text
-            for match in re.finditer(pattern, target):
-                val = match.group(1) if match.groups() else match.group(0)
-                val = _normalize(f_type, val)
-                if not _validate(f_type, val):
-                    continue
-
-                type_seen = seen_values_by_type.setdefault(f_type, set())
-                if val.lower() in type_seen:
-                    continue
-                type_seen.add(val.lower())
-
-                start = max(0, match.start() - 40)
-                end = min(len(text), match.end() + 40)
-                snippet = text[start:end].replace('\n', ' ').strip()
-
-                raw.append(ExtractedEntityItem(
-                    feature_type=f_type,
-                    feature_value=val,
-                    context=snippet[:250],
-                    description=f"Rule-based regex detected {f_type}",
-                    confidence_score=base_score,
-                ))
-        except Exception as e:
-            print(f"[Regex Warning] {f_type} pattern error: {e}")
-
-    return _dedupe(raw)
-
-
-# ---------------------------------------------------------------------------
-# Gemini extraction
-# ---------------------------------------------------------------------------
-EXTRACT_SYSTEM_PROMPT = """You are an elite Cyber Threat Intelligence (CTI) extraction agent.
-You extract structured entities from scraped dark-web text (forums, markets, leak sites).
-
-━━━ ENTITY TYPES ━━━
-Syntactic (find every literal occurrence):
-  email         — full email address
-  username      — handle, alias, vendor name, or forum account
-  ip            — IPv4 address
-  crypto_wallet — any cryptocurrency address (BTC, ETH, XMR, LTC, DOGE, ZEC, TRON)
-  pgp_key       — armored PGP public key block OR a labeled fingerprint
-  onion_url     — v2/v3 .onion URL or bare host
-  xmpp          — Jabber/XMPP address
-
-Semantic (infer from context):
-  product       — item being sold (name, strain, drug, service)
-  post          — forum thread or listing title
-  review        — buyer feedback / vendor rating text
-  other         — anything valuable that fits none of the above
-
-━━━ OUTPUT FIELDS ━━━
-  feature_type     — one of the types above (lowercase)
-  feature_value    — the EXACT string as it appears (do not paraphrase)
-  context          — 1-2 sentence excerpt that PROVES the extraction
-  description      — short label ("Vendor Telegram handle", "BTC wallet for escrow")
-  confidence_score — 0.0 – 1.0 (see rubric)
-
-━━━ CONFIDENCE RUBRIC ━━━
-  0.95–1.00  Exact-format match with unambiguous context
-             (wallet passes format check, armored PGP block, complete email)
-  0.80–0.94  Clear context but minor ambiguity
-             (handle mentioned as alias but not explicitly "contact @x")
-  0.60–0.79  Plausible but context is weak or the value could be something else
-  below 0.60 DO NOT INCLUDE — return nothing for this candidate
-
-━━━ RULES ━━━
-1. Extract EVERY distinct occurrence. Do not deduplicate within your output.
-2. NEVER invent values. If it's not literally in the text, don't return it.
-3. NEVER paraphrase a value. `feature_value` must be a verbatim substring.
-4. Do NOT return usernames that are parts of email addresses.
-5. Do NOT return a wallet address unless it matches the format of that chain.
-6. Do NOT return common English words as usernames.
-7. `context` MUST be a real substring of the source text (you may trim with "…").
-8. If nothing extractable is present, return an empty features list.
-
-━━━ EXAMPLES ━━━
-
-INPUT: "Contact vendor @dark_market_01 or email darkmarket@protonmail.com for bulk orders. BTC: bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
-OUTPUT:
-[
-  {"feature_type":"username","feature_value":"dark_market_01",
-   "context":"Contact vendor @dark_market_01 or email darkmarket@protonmail.com",
-   "description":"Vendor Telegram handle","confidence_score":0.92},
-  {"feature_type":"email","feature_value":"darkmarket@protonmail.com",
-   "context":"or email darkmarket@protonmail.com for bulk orders",
-   "description":"Vendor contact email","confidence_score":0.95},
-  {"feature_type":"crypto_wallet","feature_value":"bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
-   "context":"BTC: bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
-   "description":"Bitcoin wallet for payments","confidence_score":0.98}
-]
-
-INPUT: "Seller claims 5g of Afghan heroin at $120 per gram. Buyer @user_xyz gave 5 stars."
-OUTPUT:
-[
-  {"feature_type":"product","feature_value":"Afghan heroin",
-   "context":"5g of Afghan heroin at $120 per gram",
-   "description":"Listed narcotic product","confidence_score":0.90},
-  {"feature_type":"username","feature_value":"user_xyz",
-   "context":"Buyer @user_xyz gave 5 stars",
-   "description":"Forum buyer handle","confidence_score":0.85},
-  {"feature_type":"review","feature_value":"gave 5 stars",
-   "context":"Buyer @user_xyz gave 5 stars",
-   "description":"Buyer feedback","confidence_score":0.80}
-]
-
-NEGATIVE — do NOT extract:
-  • "@gmail" from "user@gmail.com" (that's part of an email, not a handle)
-  • "admin", "user", "test" as usernames (too generic)
-  • Any address that fails the chain's format (e.g. a 20-char string as a BTC address)
-"""
-
-EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", EXTRACT_SYSTEM_PROMPT),
-    ("human", "Scraped Dark Web Document Text:\n\n{text}"),
-])
-
-
-def _try_gemini(text: str) -> List[ExtractedEntityItem]:
-    """Run Gemini structured extraction. Returns [] on any failure."""
-    llm = get_gemini_llm(temperature=0.1, max_tokens=8000)
-    if not llm:
-        print("[AI Extractor] GOOGLE_API_KEY not set — skipping Gemini")
-        return []
-
-    try:
-        structured_llm = llm.with_structured_output(ExtractedFeatureBatch)
-        chain = EXTRACT_PROMPT | structured_llm
-
-        result: ExtractedFeatureBatch = chain.invoke(
-            {"text": text[:GEMINI_DOC_CHARS]}
+    # ── PRODUCT ──────────────────────────────────────────────────────────────
+    product = structured.get("product") or {}
+    if product.get("title"):
+        prov = product.get("provenance") or {}
+        line_start = prov.get("line_start")
+        line_end = prov.get("line_end") or line_start
+        prices = product.get("prices") or {}
+        price_str = (
+            prices.get("current") or prices.get("listed") or
+            (f"${prices['range_low']}-${prices['range_high']}" if prices.get("range_low") else "")
         )
+        context_str = f"Product: {product['title']}"
+        if price_str:
+            context_str += f" | Price: ${price_str}"
+        if product.get("category"):
+            context_str += f" | Category: {product['category']}"
 
-        features = result.features if result and result.features else []
-        if not features:
-            print("[AI Extractor] Gemini returned 0 features.")
-            return []
+        items.append(ExtractedEntityItem(
+            feature_type="product",
+            feature_value=product["title"],
+            context=context_str[:250],
+            description=(
+                f"Dark-web product listing: '{product['title']}'. "
+                + (f"Priced at ${price_str}. " if price_str else "")
+                + (f"Category: {product.get('category', 'unknown')}. " )
+                + (f"Rating: {product['overall_rating']}/5 ({product.get('review_count', 0)} reviews). "
+                   if product.get("overall_rating") else "")
+                + "Cross-reference vendor and reviews on this page to build the seller's profile."
+            ),
+            confidence_score=0.95,
+            source_line_start=line_start,
+            source_line_end=line_end,
+            source_method=prov.get("method", "regex"),
+            page_type=page_type,
+            short_label="Dark-web product listing",
+            category="activity",
+            risk_level="low",
+            tags=product.get("tags") or [],
+        ))
 
-        # Pass Gemini output through the same validation/dedup pipeline
-        cleaned: List[ExtractedEntityItem] = []
-        for f in features:
-            v = _normalize(f.feature_type, f.feature_value)
-            if not _validate(f.feature_type, v):
-                continue
-            cleaned.append(ExtractedEntityItem(
-                feature_type=f.feature_type,
-                feature_value=v,
-                context=(f.context or "")[:250],
-                description=(f.description or "")[:250],
-                confidence_score=f.confidence_score,
+    # ── VENDOR ───────────────────────────────────────────────────────────────
+    vendor = structured.get("vendor") or {}
+    if vendor.get("name"):
+        prov = vendor.get("provenance") or {}
+        line_start = prov.get("line_start")
+        contacts = vendor.get("contacts") or {}
+
+        items.append(ExtractedEntityItem(
+            feature_type="username",
+            feature_value=vendor["name"],
+            context=f"Vendor/seller: {vendor['name']}"
+                    + (f" | Rating: {vendor['rating']}/5" if vendor.get("rating") else ""),
+            description=(
+                f"Dark-web vendor/seller identity '{vendor['name']}' identified on this page. "
+                + (f"Rated {vendor['rating']}/5 by buyers. " if vendor.get("rating") else "")
+                + (f"Vendor type: {vendor.get('type', 'marketplace_vendor').replace('_', ' ')}. ")
+                + "This handle is the primary anchor for cross-referencing this seller's activity "
+                + "across multiple listings and domains."
+            ),
+            confidence_score=0.92,
+            source_line_start=line_start,
+            source_line_end=line_start,
+            source_method=prov.get("method", "regex_vendor"),
+            page_type=page_type,
+            short_label="Vendor/seller handle",
+            category="identity",
+            risk_level="medium",
+            actor_role="vendor",
+            tags=["vendor", "seller-identity"],
+        ))
+
+        # Vendor contact details
+        if contacts.get("email"):
+            items.append(ExtractedEntityItem(
+                feature_type="email",
+                feature_value=contacts["email"],
+                context=f"Vendor contact email for {vendor['name']}",
+                description=_make_description("email", contacts["email"], f"Vendor: {vendor['name']}", "regex"),
+                confidence_score=0.95,
+                source_line_start=line_start,
+                source_line_end=line_start,
+                source_method="regex",
+                page_type=page_type,
+                short_label="Vendor contact email",
+                category="communication",
+                risk_level="medium",
+                actor_role="vendor",
+                related_indicators=[vendor["name"]],
             ))
 
-        cleaned = _dedupe(cleaned)
-        print(f"[AI Extractor] Gemini ({DEFAULT_GEMINI_MODEL}) "
-              f"extracted {len(features)} raw → {len(cleaned)} validated features.")
-        return cleaned
+        if contacts.get("telegram"):
+            items.append(ExtractedEntityItem(
+                feature_type="username",
+                feature_value=contacts["telegram"],
+                context=f"Telegram handle for vendor {vendor['name']}",
+                description=_make_description("username", contacts["telegram"], f"Telegram: @{contacts['telegram']}", "regex"),
+                confidence_score=0.90,
+                source_line_start=line_start,
+                source_line_end=line_start,
+                source_method="regex",
+                page_type=page_type,
+                short_label="Vendor Telegram handle",
+                category="communication",
+                risk_level="medium",
+                actor_role="vendor",
+                related_indicators=[vendor["name"]],
+            ))
 
-    except Exception as e:
-        print(f"[AI Extractor] Gemini failed: {type(e).__name__}: {str(e)[:240]}")
-        return []
+        if contacts.get("jabber"):
+            items.append(ExtractedEntityItem(
+                feature_type="xmpp",
+                feature_value=contacts["jabber"],
+                context=f"XMPP/Jabber for vendor {vendor['name']}",
+                description=_make_description("xmpp", contacts["jabber"], f"Jabber: {contacts['jabber']}", "regex"),
+                confidence_score=0.90,
+                source_line_start=line_start,
+                source_line_end=line_start,
+                source_method="regex",
+                page_type=page_type,
+                short_label="Vendor XMPP/Jabber",
+                category="communication",
+                risk_level="medium",
+                actor_role="vendor",
+                related_indicators=[vendor["name"]],
+            ))
+
+    # ── REVIEWS ──────────────────────────────────────────────────────────────
+    reviews = structured.get("reviews") or []
+    for rev in reviews:
+        prov = rev.get("provenance") or {}
+        author = rev.get("author", "Anonymous")
+        if author.lower() in ("anonymous", "none", "n/a", ""):
+            continue
+
+        line_start = prov.get("line_start")
+        line_end = prov.get("line_end") or line_start
+        comment = (rev.get("comment") or "")[:200]
+        context_str = (
+            f"Review by {author}"
+            + (f" [{rev['rating']}/5]" if rev.get("rating") else "")
+            + (f" ({rev.get('date', '')})" if rev.get("date") else "")
+            + f": {comment[:80]}"
+        )
+
+        items.append(ExtractedEntityItem(
+            feature_type="review",
+            feature_value=comment[:250] if comment else f"Review by {author}",
+            context=context_str[:250],
+            description=(
+                f"Customer review submitted by '{author}'"
+                + (f" rated {rev['rating']}/5" if rev.get("rating") else "")
+                + (f" on {rev['date']}" if rev.get("date") and rev["date"] != "Unknown" else "")
+                + f". Comment: \"{comment[:120]}\". "
+                + "This reviewer is a likely buyer — cross-reference their username against other pages to build a buyer profile."
+            ),
+            confidence_score=prov.get("confidence", 0.88),
+            source_line_start=line_start,
+            source_line_end=line_end,
+            source_method=prov.get("method", "regex_review"),
+            page_type=page_type,
+            short_label=f"Buyer review by {author}",
+            category="activity",
+            risk_level="low",
+            actor_role="buyer",
+            tags=["review", "buyer-feedback"],
+        ))
+
+        # Reviewer as a username identity
+        items.append(ExtractedEntityItem(
+            feature_type="username",
+            feature_value=author,
+            context=f"Reviewer username: {author}",
+            description=(
+                f"Reviewer identity '{author}' derived from a customer review. "
+                + f"Has left at least one rating on this page. "
+                + "Track this handle across other pages/domains to build a buyer profile."
+            ),
+            confidence_score=0.82,
+            source_line_start=line_start,
+            source_line_end=line_start,
+            source_method=prov.get("method", "regex_review"),
+            page_type=page_type,
+            short_label=f"Buyer username: {author}",
+            category="identity",
+            risk_level="low",
+            actor_role="buyer",
+        ))
+
+    # ── CATALOG PRODUCTS ─────────────────────────────────────────────────────
+    catalog = structured.get("catalog_products") or []
+    for cp in catalog:
+        prov = cp.get("provenance") or {}
+        title = cp.get("title", "")
+        if not title:
+            continue
+        line_start = prov.get("line_start")
+        items.append(ExtractedEntityItem(
+            feature_type="product",
+            feature_value=title,
+            context=(
+                f"Catalog listing: {title}"
+                + (f" | ${cp['price']}" if cp.get("price") else "")
+                + (f" | Vendor: {cp['vendor']}" if cp.get("vendor") else "")
+            )[:250],
+            description=(
+                f"Dark-web catalog item '{title}' found on a listing/archive page. "
+                + (f"Price: {cp.get('price', 'unknown')}. ")
+                + (f"Vendor: {cp['vendor']}. " if cp.get("vendor") else "")
+                + "Enumerate vendor for dossier build."
+            ),
+            confidence_score=prov.get("confidence", 0.85),
+            source_line_start=line_start,
+            source_line_end=line_start,
+            source_method=prov.get("method", "regex_card"),
+            page_type=page_type,
+            short_label="Catalog product",
+            category="activity",
+            risk_level="low",
+            tags=["catalog", "listing"],
+        ))
+
+    # ── REGEX SWEEP — crypto, onion, email, PGP across all page text ─────────
+    text = loader.raw_text
+    regex_hits = _regex_sweep(text, loader, page_type)
+    items.extend(regex_hits)
+
+    # ── SIDEBAR contacts / onion URLs ────────────────────────────────────────
+    sidebar = structured.get("sidebar") or {}
+    top_vendors = sidebar.get("top_vendors") or []
+    for tv in top_vendors:
+        name = tv.get("name", "")
+        if name:
+            items.append(ExtractedEntityItem(
+                feature_type="username",
+                feature_value=name,
+                context=f"Top-rated vendor in sidebar: {name}"
+                        + (f" [{tv['rating']}/5]" if tv.get("rating") else ""),
+                description=(
+                    f"'{name}' appears in the marketplace's 'Top Rated Vendors' sidebar widget, "
+                    + "indicating a high-volume or well-reviewed seller on this platform."
+                ),
+                confidence_score=0.80,
+                source_method="regex",
+                page_type=page_type,
+                short_label="Top-rated sidebar vendor",
+                category="identity",
+                risk_level="low",
+                actor_role="vendor",
+            ))
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Regex sweep — patterns from patterns.py across the full page text
+# ---------------------------------------------------------------------------
+
+_REGEX_SWEEPS: List[Tuple[str, Any, float]] = [
+    ("onion_url", pat.ONION_DOMAIN, 0.95),
+    ("email", pat.EMAIL_ADDR, 0.93),
+    ("crypto_wallet", pat.BTC_ADDRESS, 0.97),
+    ("crypto_wallet", pat.XMR_ADDRESS, 0.97),
+    ("username", pat.TELEGRAM_HANDLE, 0.88),
+    ("xmpp", pat.JABBER_XMPP, 0.90),
+]
+
+# PGP block pattern (not in patterns.py, add locally)
+_PGP_BLOCK = re.compile(
+    r"-----BEGIN PGP PUBLIC KEY BLOCK-----[\s\S]{50,}?-----END PGP PUBLIC KEY BLOCK-----",
+)
+
+
+def _regex_sweep(
+    text: str,
+    loader: InMemoryTextLoader,
+    page_type: str,
+) -> List[ExtractedEntityItem]:
+    """Apply compiled regex patterns across the full page text."""
+    items: List[ExtractedEntityItem] = []
+    seen: set = set()
+
+    for f_type, compiled_pat, score in _REGEX_SWEEPS:
+        for m in compiled_pat.finditer(text):
+            val = m.group(1) if m.groups() else m.group(0)
+            val = val.strip()
+            if not val or (f_type, val.lower()) in seen:
+                continue
+            seen.add((f_type, val.lower()))
+
+            line_no = loader.char_offset_to_line(m.start())
+            start = max(0, m.start() - 50)
+            end = min(len(text), m.end() + 50)
+            snippet = text[start:end].replace("\n", " ").strip()
+
+            items.append(ExtractedEntityItem(
+                feature_type=f_type,
+                feature_value=val,
+                context=snippet[:250],
+                description=_make_description(f_type, val, snippet, "regex"),
+                confidence_score=score,
+                source_line_start=line_no,
+                source_line_end=line_no,
+                source_method="regex",
+                page_type=page_type,
+                short_label=f"{f_type.replace('_', ' ').title()} (pattern match)",
+                category=CATEGORY_BY_TYPE.get(f_type, "other"),
+                risk_level=RISK_BY_TYPE.get(f_type, "low"),
+                tags=["regex", "deterministic-match"],
+            ))
+
+    # PGP blocks
+    for m in _PGP_BLOCK.finditer(text):
+        val = m.group(0).strip()
+        if ("pgp_key", val.lower()[:40]) in seen:
+            continue
+        seen.add(("pgp_key", val.lower()[:40]))
+        line_no = loader.char_offset_to_line(m.start())
+        items.append(ExtractedEntityItem(
+            feature_type="pgp_key",
+            feature_value=val[:500],
+            context="Full PGP public key block found on page",
+            description=(
+                f"An armored PGP public key block was detected on this page. "
+                "PGP keys are a strong operational security signal — the key owner "
+                "intentionally published it here for encrypted communications. "
+                "Extract and import into a keyserver lookup to identify the owner."
+            ),
+            confidence_score=0.99,
+            source_line_start=line_no,
+            source_line_end=loader.char_offset_to_line(m.end()),
+            source_method="regex",
+            page_type=page_type,
+            short_label="PGP public key block",
+            category="identity",
+            risk_level="medium",
+            tags=["pgp", "opsec"],
+        ))
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def _dedupe(items: List[ExtractedEntityItem]) -> List[ExtractedEntityItem]:
+    seen: dict = {}
+    order: list = []
+    for it in items:
+        key = (it.feature_type.lower(), it.feature_value.lower()[:120])
+        if key not in seen:
+            seen[key] = it
+            order.append(key)
+        else:
+            if (it.confidence_score or 0) > (seen[key].confidence_score or 0):
+                seen[key] = it
+    return [seen[k] for k in order]
 
 
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
-def extract_features_with_llm(text: str) -> List[ExtractedEntityItem]:
+
+def extract_features_with_llm(text: str, filename: str = "page.txt") -> List[ExtractedEntityItem]:
     """
-    Extract entities from scraped text.
+    Main extraction pipeline (replaces the old Gemini extractor).
 
     Strategy:
-      1. Run both Gemini AND regex.
-      2. Union the results, deduping by (type, value) — regex fills syntactic
-         gaps Gemini missed; Gemini contributes semantic types regex can't.
-      3. If Gemini yields nothing, regex alone is the answer.
+      1. Load text into InMemoryTextLoader (line indexing, boilerplate strip)
+      2. Classify page type (PRODUCT_DETAIL | CATALOG_LISTING | GENERAL)
+      3. Run structured regex extractors by page type
+      4. Apply global regex sweep (crypto, onion, email, PGP)
+      5. If feature count < threshold AND Ollama available → qwen3:1.7b fallback
+      6. Flatten all structured data → List[ExtractedEntityItem]
+      7. Deduplicate and return
     """
     if not text or not text.strip():
         return []
 
-    gemini_features = _try_gemini(text)
-    regex_features = regex_fallback_extractor(text)
+    loader = InMemoryTextLoader(text, filename=filename)
+    page_type = classify_page(text)
+    ollama_ok = is_ollama_available()
 
-    if gemini_features and regex_features:
-        # Regex wins ties on syntactic types (deterministic); Gemini wins on semantic.
-        combined = gemini_features + regex_features
-        merged = _dedupe(combined)
-        print(f"[AI Extractor] Merged: {len(gemini_features)} gemini + "
-              f"{len(regex_features)} regex → {len(merged)} unique.")
-        return merged
+    # Build structured extraction by page type
+    structured: Dict[str, Any] = {"page_type": page_type}
 
-    if gemini_features:
-        return gemini_features
-    if regex_features:
-        print("[AI Extractor] Gemini returned nothing — using regex only.")
-        return regex_features
+    if page_type == PageType.PRODUCT_DETAIL:
+        structured["product"] = extract_product(loader)
+        structured["reviews"] = extract_reviews(loader)
+        structured["vendor"] = extract_vendor(loader)
+        structured["catalog_products"] = []
+    elif page_type == PageType.CATALOG_LISTING:
+        structured["product"] = None
+        structured["reviews"] = []
+        structured["vendor"] = extract_vendor(loader)
+        structured["catalog_products"] = extract_catalog(loader)
+    else:  # GENERAL
+        structured["product"] = extract_product(loader)
+        structured["reviews"] = extract_reviews(loader)
+        structured["vendor"] = extract_vendor(loader)
+        structured["catalog_products"] = []
 
-    print("[AI Extractor] No features extracted.")
-    return []
+    structured["sidebar"] = extract_sidebar(loader)
+    top_vendors = extract_top_vendors_sidebar(loader)
+    if top_vendors:
+        structured["sidebar"]["top_vendors"] = top_vendors
+
+    feat_count = count_features(structured)
+
+    # LLM fallback if regex yielded very little
+    if feat_count < MIN_FEATURES_REGEX and ollama_ok:
+        print(f"[Extractor] Low feature count ({feat_count}), running qwen3:1.7b fallback...")
+        llm_data = llm_fallback_extract(loader)
+        if not structured.get("product") and llm_data.get("product"):
+            structured["product"] = llm_data["product"]
+        if not structured.get("reviews") and llm_data.get("reviews"):
+            structured["reviews"] = llm_data["reviews"]
+        if not structured.get("vendor") and llm_data.get("vendor"):
+            structured["vendor"] = llm_data["vendor"]
+
+    # Generate summary
+    try:
+        structured["summary"] = summarize_page(loader, structured)
+    except Exception:
+        structured["summary"] = ""
+
+    # Flatten structured → flat items
+    items = _flatten_structured(structured, loader)
+    items = _dedupe(items)
+
+    print(
+        f"[Extractor] Page type: {page_type} | "
+        f"Structured features: {feat_count} | "
+        f"Flat items: {len(items)} | "
+        f"Ollama: {'ON' if ollama_ok else 'OFF'}"
+    )
+
+    return items
