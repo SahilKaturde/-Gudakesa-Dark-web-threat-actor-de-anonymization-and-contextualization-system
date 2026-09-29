@@ -1,5 +1,10 @@
 # GUDAKESA - Dark Web Threat Actor De-anonymization and Contextualization System
 
+![Python Version](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
+![Django](https://img.shields.io/badge/Django-092E20?style=flat&logo=django&logoColor=white)
+![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)
+![Vite](https://img.shields.io/badge/Vite-B73BFE?style=flat&logo=vite&logoColor=FFD62E)
+
 Gudakesa is a powerful system designed to track, analyze, and de-anonymize threat actors on the dark web through intelligent crawling, contextualization, and feature extraction.
 
 ## 🚀 What is Working
